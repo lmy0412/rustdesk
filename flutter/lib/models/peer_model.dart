@@ -22,6 +22,10 @@ class Peer {
   String device_group_name;
   String note;
   bool? sameServer;
+  String? addressBookInstanceId;
+  String? addressBookSource;
+  String? addressBookPermission;
+  int? addressBookShareId;
 
   String getId() {
     if (alias != '') {
@@ -45,7 +49,19 @@ class Peer {
         loginName = json['loginName'] ?? '',
         device_group_name = json['device_group_name'] ?? '',
         note = json['note'] is String ? json['note'] : '',
-        sameServer = json['same_server'];
+        sameServer = json['same_server'],
+        addressBookInstanceId = json['address_book_instance_id'] is String
+            ? json['address_book_instance_id']
+            : null,
+        addressBookSource = json['address_book_source'] is String
+            ? json['address_book_source']
+            : null,
+        addressBookPermission = json['address_book_permission'] is String
+            ? json['address_book_permission']
+            : null,
+        addressBookShareId = json['address_book_share_id'] is int
+            ? json['address_book_share_id']
+            : null;
 
   Map<String, dynamic> toJson() {
     return <String, dynamic>{
@@ -64,6 +80,10 @@ class Peer {
       'device_group_name': device_group_name,
       'note': note,
       'same_server': sameServer,
+      'address_book_instance_id': addressBookInstanceId,
+      'address_book_source': addressBookSource,
+      'address_book_permission': addressBookPermission,
+      'address_book_share_id': addressBookShareId,
     };
   }
 
@@ -79,6 +99,17 @@ class Peer {
     if (includingHash) {
       res['hash'] = hash;
     }
+    return res;
+  }
+
+  Map<String, dynamic> toAddressBookCacheJson({required bool includingHash}) {
+    final res = toCustomJson(includingHash: includingHash);
+    res.addAll({
+      'address_book_instance_id': addressBookInstanceId,
+      'address_book_source': addressBookSource,
+      'address_book_permission': addressBookPermission,
+      'address_book_share_id': addressBookShareId,
+    });
     return res;
   }
 
@@ -109,6 +140,10 @@ class Peer {
     required this.device_group_name,
     required this.note,
     this.sameServer,
+    this.addressBookInstanceId,
+    this.addressBookSource,
+    this.addressBookPermission,
+    this.addressBookShareId,
   });
 
   Peer.loading()
@@ -142,7 +177,11 @@ class Peer {
         rdpUsername == other.rdpUsername &&
         device_group_name == other.device_group_name &&
         loginName == other.loginName &&
-        note == other.note;
+        note == other.note &&
+        addressBookInstanceId == other.addressBookInstanceId &&
+        addressBookSource == other.addressBookSource &&
+        addressBookPermission == other.addressBookPermission &&
+        addressBookShareId == other.addressBookShareId;
   }
 
   Peer.copy(Peer other)
@@ -161,7 +200,11 @@ class Peer {
             loginName: other.loginName,
             device_group_name: other.device_group_name,
             note: other.note,
-            sameServer: other.sameServer);
+            sameServer: other.sameServer,
+            addressBookInstanceId: other.addressBookInstanceId,
+            addressBookSource: other.addressBookSource,
+            addressBookPermission: other.addressBookPermission,
+            addressBookShareId: other.addressBookShareId);
 }
 
 enum UpdateEvent { online, load }

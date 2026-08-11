@@ -39,6 +39,10 @@ struct UIHostHandler;
 pub fn start(args: &mut [String]) {
     #[cfg(target_os = "macos")]
     crate::platform::delegate::show_dock();
+    if args.is_empty() {
+        // Sciter 主界面显式取得权威认证 writer；远程会话等子进程不会打开该状态。
+        let _ = initialize_sciter_auth();
+    }
     #[cfg(all(target_os = "linux", feature = "inline"))]
     {
         let app_dir = std::env::var("APPDIR").unwrap_or("".to_string());
@@ -268,6 +272,35 @@ impl UI {
         set_local_option(key, value);
     }
 
+    fn get_sciter_auth_snapshot(&self) -> String {
+        get_sciter_auth_snapshot()
+    }
+
+    fn start_sciter_auth_login(
+        &self,
+        login_body: String,
+        attempt_json: String,
+        parent_job_id: String,
+    ) -> String {
+        start_sciter_auth_login(login_body, attempt_json, parent_job_id)
+    }
+
+    fn cancel_sciter_auth_attempt(&self, attempt_json: String) -> bool {
+        cancel_sciter_auth_attempt(attempt_json)
+    }
+
+    fn start_sciter_auth_request(&self, operation: String, body: String) -> String {
+        start_sciter_auth_request(operation, body)
+    }
+
+    fn start_sciter_auth_logout(&self) -> String {
+        start_sciter_auth_logout()
+    }
+
+    fn get_sciter_auth_job_status(&self, job_id: String) -> String {
+        get_sciter_auth_job_status(job_id)
+    }
+
     fn peer_has_password(&self, id: String) -> bool {
         peer_has_password(id)
     }
@@ -346,6 +379,22 @@ impl UI {
             }
         }
         set_options(m);
+    }
+
+    fn set_server_config(
+        &self,
+        id_server: String,
+        relay_server: String,
+        api_server: String,
+        key: String,
+    ) -> bool {
+        match stage_and_publish_server_config(id_server, relay_server, api_server, key) {
+            Ok(_) => true,
+            Err(error) => {
+                log::error!("服务器配置安全发布失败: {error}");
+                false
+            }
+        }
     }
 
     fn set_option(&self, key: String, value: String) {
@@ -612,7 +661,7 @@ impl UI {
     }
 
     fn http_request(&self, url: String, method: String, body: Option<String>, header: String) {
-        http_request(url, method, body, header)
+        sciter_http_request(url, method, body, header)
     }
 
     fn post_request(&self, url: String, body: String, header: String) {
@@ -778,6 +827,12 @@ impl sciter::EventHandler for UI {
         fn get_option(String);
         fn get_local_option(String);
         fn set_local_option(String, String);
+        fn get_sciter_auth_snapshot();
+        fn start_sciter_auth_login(String, String, String);
+        fn cancel_sciter_auth_attempt(String);
+        fn start_sciter_auth_request(String, String);
+        fn start_sciter_auth_logout();
+        fn get_sciter_auth_job_status(String);
         fn get_peer_option(String, String);
         fn peer_has_password(String);
         fn forget_password(String);
@@ -786,6 +841,7 @@ impl sciter::EventHandler for UI {
         fn test_if_valid_server(String, bool);
         fn get_sound_inputs();
         fn set_options(Value);
+        fn set_server_config(String, String, String, String);
         fn set_option(String, String);
         fn get_software_update_url();
         fn get_new_version();
@@ -823,6 +879,42 @@ impl sciter::EventHandler for UI {
         fn get_builtin_option(String);
         fn is_remote_modify_enabled_by_control_permissions();
     }
+}
+
+#[doc(hidden)]
+pub fn issue9_sciter_operation_is_allowed(operation: &str) -> bool {
+    SciterSessionOperation::parse(operation).is_some()
+}
+
+#[doc(hidden)]
+pub fn issue9_sciter_generic_headers_are_allowed(headers: &str) -> bool {
+    sciter_generic_headers_are_allowed(headers)
+}
+
+#[doc(hidden)]
+pub fn issue9_sciter_option_key_is_allowed(key: &str) -> bool {
+    option_bridge_allows_write_key(key)
+}
+
+#[doc(hidden)]
+pub fn issue9_sciter_audit_is_fail_closed() -> bool {
+    crate::ui_session_interface::audit_note_fail_closed_reason().is_some()
+}
+
+#[doc(hidden)]
+pub fn issue9_sciter_safe_summary_json() -> String {
+    let user = crate::hbbs_http::auth_binding::AuthSafeUser {
+        id: Some(7),
+        name: "alice".to_owned(),
+        display_name: "Alice".to_owned(),
+        avatar: "/avatar/alice".to_owned(),
+        email: "private@example.com".to_owned(),
+        note: "private-note".to_owned(),
+        status: 1,
+        is_admin: false,
+        verifier: "private-verifier".to_owned(),
+    };
+    crate::ui_interface::sciter_safe_user_value(&user).to_string()
 }
 
 impl sciter::host::HostHandler for UIHostHandler {

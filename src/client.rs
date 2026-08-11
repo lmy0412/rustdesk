@@ -39,6 +39,8 @@ use crate::{
 #[cfg(feature = "unix-file-copy-paste")]
 use crate::{clipboard::check_clipboard_files, clipboard_file::unix_file_clip};
 pub use file_trait::FileManager;
+#[cfg(feature = "flutter")]
+use hbb_common::sodiumoxide::base64;
 #[cfg(not(feature = "flutter"))]
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use hbb_common::tokio::sync::mpsc::UnboundedSender;
@@ -47,8 +49,8 @@ use hbb_common::{
     anyhow::{anyhow, Context},
     bail,
     config::{
-        self, keys, use_ws, Config, LocalConfig, PeerConfig, PeerInfoSerde, Resolution,
-        CONNECT_TIMEOUT, READ_TIMEOUT, RELAY_PORT, RENDEZVOUS_PORT, RENDEZVOUS_SERVERS,
+        self, keys, use_ws, Config, PeerConfig, PeerInfoSerde, Resolution, CONNECT_TIMEOUT,
+        READ_TIMEOUT, RELAY_PORT, RENDEZVOUS_PORT, RENDEZVOUS_SERVERS,
     },
     fs::JobType,
     futures::future::{select_ok, FutureExt},
@@ -59,7 +61,7 @@ use hbb_common::{
     rendezvous_proto::*,
     sha2::{Digest, Sha256},
     socket_client::{connect_tcp, connect_tcp_local, ipv4_to_ipv6, new_direct_udp_for},
-    sodiumoxide::{base64, crypto::sign},
+    sodiumoxide::crypto::sign,
     timeout,
     tokio::{
         self,
@@ -121,11 +123,9 @@ pub const LOGIN_SCREEN_WAYLAND: &str = "Wayland login screen is not supported";
 #[cfg(target_os = "linux")]
 pub const SCRAP_UBUNTU_HIGHER_REQUIRED: &str = "ubuntu-21-04-required";
 #[cfg(target_os = "linux")]
-pub const SCRAP_OTHER_VERSION_OR_X11_REQUIRED: &str =
-    "wayland-requires-higher-linux-version";
+pub const SCRAP_OTHER_VERSION_OR_X11_REQUIRED: &str = "wayland-requires-higher-linux-version";
 #[cfg(target_os = "linux")]
-pub const SCRAP_XDP_PORTAL_UNAVAILABLE: &str =
-    "xdp-portal-unavailable";
+pub const SCRAP_XDP_PORTAL_UNAVAILABLE: &str = "xdp-portal-unavailable";
 pub const SCRAP_X11_REQUIRED: &str = "x11 expected";
 pub const SCRAP_X11_REF_URL: &str = "https://rustdesk.com/docs/en/manual/linux/#x11-required";
 
@@ -1686,15 +1686,8 @@ impl Default for PasswordSource {
 }
 
 impl PasswordSource {
-    // Whether the password is personal ab password
-    pub fn is_personal_ab(&self, password: &[u8]) -> bool {
-        if password.is_empty() {
-            return false;
-        }
-        match self {
-            PasswordSource::PersonalAb(p) => p == password,
-            _ => false,
-        }
+    fn is_personal_ab_source(&self) -> bool {
+        matches!(self, PasswordSource::PersonalAb(_))
     }
 
     // Whether the password is shared ab password
@@ -1718,11 +1711,226 @@ impl PasswordSource {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+const PEER_PASSWORD_PROVENANCE_KEY: &str = "peer-password-provenance";
+const PEER_PASSWORD_PROVENANCE_EXPLICIT_V1: &str = "explicit-user-v1";
+
+pub(crate) fn protected_peer_option_key(key: &str) -> bool {
+    key.trim()
+        .eq_ignore_ascii_case(PEER_PASSWORD_PROVENANCE_KEY)
+}
+
+pub(crate) fn peer_config_has_explicit_password(config: &PeerConfig) -> bool {
+    !config.password.is_empty()
+        && config
+            .options
+            .get(PEER_PASSWORD_PROVENANCE_KEY)
+            .is_some_and(|value| value == PEER_PASSWORD_PROVENANCE_EXPLICIT_V1)
+}
+
+fn peer_config_has_password_provenance_option(config: &PeerConfig) -> bool {
+    config
+        .options
+        .keys()
+        .any(|key| protected_peer_option_key(key))
+}
+
+fn peer_config_password_candidate(config: &PeerConfig) -> Vec<u8> {
+    if peer_config_has_explicit_password(config) {
+        config.password.clone()
+    } else {
+        Vec::new()
+    }
+}
+
+fn quarantine_unproven_peer_config_password(config: &mut PeerConfig) -> bool {
+    let explicitly_marked = peer_config_has_explicit_password(config);
+    let options_len = config.options.len();
+    config.options.retain(|key, _| {
+        !protected_peer_option_key(key)
+            || (explicitly_marked && key == PEER_PASSWORD_PROVENANCE_KEY)
+    });
+    let mut changed = config.options.len() != options_len;
+    if explicitly_marked {
+        return changed;
+    }
+    if !config.password.is_empty() {
+        config.password.clear();
+        changed = true;
+    }
+    changed
+}
+
+fn mark_peer_config_password_explicit(config: &mut PeerConfig) {
+    config
+        .options
+        .retain(|key, _| !protected_peer_option_key(key));
+    config.options.insert(
+        PEER_PASSWORD_PROVENANCE_KEY.to_owned(),
+        PEER_PASSWORD_PROVENANCE_EXPLICIT_V1.to_owned(),
+    );
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn mark_peer_config_password_explicit_for_test(config: &mut PeerConfig) {
+    mark_peer_config_password_explicit(config);
+}
+
+pub(crate) fn clear_peer_config_password(config: &mut PeerConfig) {
+    config.password.clear();
+    config
+        .options
+        .retain(|key, _| !protected_peer_option_key(key));
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PeerConfigPasswordUpdate {
+    Unchanged,
+    Remembered,
+    Removed,
+}
+
+fn update_peer_config_password(
+    config: &mut PeerConfig,
+    connected_password: &[u8],
+    source: &PasswordSource,
+    remember: bool,
+    is_shared_password: bool,
+) -> PeerConfigPasswordUpdate {
+    if source.is_personal_ab_source() {
+        // 已有显式用户密码可以保留，但 PersonalAb 永远不能写入可信来源标记。
+        if peer_config_has_explicit_password(config) {
+            // 清理历史大小写/空白变体，只保留唯一 canonical 标记。
+            mark_peer_config_password_explicit(config);
+            return PeerConfigPasswordUpdate::Unchanged;
+        }
+        if !config.password.is_empty() || peer_config_has_password_provenance_option(config) {
+            clear_peer_config_password(config);
+            return PeerConfigPasswordUpdate::Removed;
+        }
+        return PeerConfigPasswordUpdate::Unchanged;
+    }
+    if remember {
+        if connected_password.is_empty() || is_shared_password {
+            return PeerConfigPasswordUpdate::Unchanged;
+        }
+        let changed =
+            config.password != connected_password || !peer_config_has_explicit_password(config);
+        if changed {
+            config.password = connected_password.to_vec();
+            mark_peer_config_password_explicit(config);
+            return PeerConfigPasswordUpdate::Remembered;
+        }
+        return PeerConfigPasswordUpdate::Unchanged;
+    }
+    if !config.password.is_empty() || peer_config_has_password_provenance_option(config) {
+        clear_peer_config_password(config);
+        return PeerConfigPasswordUpdate::Removed;
+    }
+    PeerConfigPasswordUpdate::Unchanged
+}
+
+fn finish_passwordless_switch(source: &mut PasswordSource) {
+    // PersonalAb 来源必须保留到下一次 hash challenge，由当前 native allowlist 重新验证。
+    if !source.is_personal_ab_source() {
+        *source = PasswordSource::Undefined;
+    }
+}
+
 struct ConnToken {
+    peer_id: String,
     password: Vec<u8>,
     password_source: PasswordSource,
     session_id: u64,
+    personal_hash_capability:
+        Option<crate::hbbs_http::auth_binding::PersonalHashConnectionCapability>,
+    issued_at: std::time::Instant,
+}
+
+const CONN_TOKEN_TTL: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+const MAX_CONN_TOKEN_CAPABILITIES: usize = 1024;
+
+fn conn_token_registry() -> &'static Mutex<HashMap<String, ConnToken>> {
+    static REGISTRY: std::sync::OnceLock<Mutex<HashMap<String, ConnToken>>> =
+        std::sync::OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn prune_expired_conn_tokens(registry: &mut HashMap<String, ConnToken>, now: std::time::Instant) {
+    registry.retain(|_, token| {
+        now.checked_duration_since(token.issued_at)
+            .is_some_and(|age| age <= CONN_TOKEN_TTL)
+    });
+}
+
+fn register_native_conn_token(mut token: ConnToken, now: std::time::Instant) -> Option<String> {
+    token.issued_at = now;
+    let mut registry = conn_token_registry().lock().ok()?;
+    prune_expired_conn_tokens(&mut registry, now);
+    if registry.len() >= MAX_CONN_TOKEN_CAPABILITIES {
+        return None;
+    }
+    let mut token = Some(token);
+    for _ in 0..3 {
+        let capability_id = hbb_common::uuid::Uuid::new_v4().to_string();
+        if !registry.contains_key(&capability_id) {
+            let Some(token) = token.take() else {
+                return None;
+            };
+            registry.insert(capability_id.clone(), token);
+            return Some(capability_id);
+        }
+    }
+    None
+}
+
+fn consume_native_conn_token_with_validator(
+    capability_id: &str,
+    expected_peer_id: &str,
+    now: std::time::Instant,
+    validate_personal: impl FnOnce(
+        &crate::hbbs_http::auth_binding::PersonalHashConnectionCapability,
+    ) -> bool,
+) -> Option<ConnToken> {
+    if capability_id.len() > 128 || hbb_common::uuid::Uuid::parse_str(capability_id).is_err() {
+        return None;
+    }
+    let token = {
+        let mut registry = conn_token_registry().lock().ok()?;
+        prune_expired_conn_tokens(&mut registry, now);
+        // 无论 peer 是否匹配都原子消费，避免 capability 被探测后继续重放。
+        registry.remove(capability_id)?
+    };
+    if token.peer_id != expected_peer_id {
+        return None;
+    }
+    match (
+        token.password_source.is_personal_ab_source(),
+        token.personal_hash_capability.as_ref(),
+    ) {
+        (true, Some(capability)) if validate_personal(capability) => Some(token),
+        (false, None) => Some(token),
+        _ => None,
+    }
+}
+
+fn consume_native_conn_token(capability_id: &str, expected_peer_id: &str) -> Option<ConnToken> {
+    consume_native_conn_token_with_validator(
+        capability_id,
+        expected_peer_id,
+        std::time::Instant::now(),
+        |capability| {
+            crate::hbbs_http::auth_binding::personal_hash_connection_capability_is_current(
+                capability,
+            )
+        },
+    )
+}
+
+pub(crate) fn clear_native_conn_token_registry() {
+    if let Ok(mut registry) = conn_token_registry().lock() {
+        registry.clear();
+    }
 }
 
 /// Login config handler for [`Client`].
@@ -1827,13 +2035,21 @@ impl LoginConfigHandler {
 
         self.id = id;
         self.conn_type = conn_type;
-        let config = self.load_config();
+        let mut config = self.load_config();
+        if quarantine_unproven_peer_config_password(&mut config) {
+            // 旧版本无法区分用户记住的密码与 personal hash；升级时必须保守隔离。
+            config.store(&self.id);
+            log::info!("已隔离缺少可信来源标记的对端密码: {}", self.id);
+        }
         self.remember = !config.password.is_empty();
         self.config = config;
 
+        self.password.clear();
+        self.password_source = PasswordSource::Undefined;
+        // Dart 只持有随机、一次性的 opaque capability；不存在 raw JSON 兼容回退。
         let conn_token = conn_token
-            .map(|x| serde_json::from_str::<ConnToken>(&x).ok())
-            .flatten();
+            .as_deref()
+            .and_then(|capability_id| consume_native_conn_token(capability_id, &self.id));
         let mut sid = 0;
         if let Some(token) = conn_token {
             sid = token.session_id;
@@ -1935,6 +2151,10 @@ impl LoginConfigHandler {
     /// * `k` - key of option
     /// * `v` - value of option
     pub fn set_option(&mut self, k: String, v: String) {
+        if protected_peer_option_key(&k) {
+            log::warn!("通用会话配置拒绝写入受保护的密码来源标记");
+            return;
+        }
         let mut config = self.load_config();
         if v == self.get_option(&k) {
             return;
@@ -2068,6 +2288,10 @@ impl LoginConfigHandler {
     // `toggle_option()` is only called in a session.
     // Custom client advanced settings will not effect this function.
     pub fn toggle_option(&mut self, name: String) -> Option<Message> {
+        if protected_peer_option_key(&name) {
+            log::warn!("通用会话配置拒绝切换受保护的密码来源标记");
+            return None;
+        }
         let mut option = OptionMessage::default();
         let mut config = self.load_config();
         if name == "show-remote-cursor" {
@@ -2476,6 +2700,9 @@ impl LoginConfigHandler {
     }
 
     pub fn get_option(&self, k: &str) -> String {
+        if protected_peer_option_key(k) {
+            return String::new();
+        }
         if let Some(v) = self.config.options.get(k) {
             v.clone()
         } else {
@@ -2541,28 +2768,23 @@ impl LoginConfigHandler {
         let mut config = self.load_config();
         config.info = serde;
         let password = self.password.clone();
-        let password0 = config.password.clone();
         let remember = self.remember;
         let hash = self.hash.clone();
-        if remember {
-            // remember is true: use PeerConfig password or ui login
-            // not sync shared password to recent
-            if !password.is_empty()
-                && password != password0
-                && !self.password_source.is_shared_ab(&password, &hash)
-            {
-                config.password = password.clone();
+        let is_shared_password = self.password_source.is_shared_ab(&password, &hash);
+        match update_peer_config_password(
+            &mut config,
+            &password,
+            &self.password_source,
+            remember,
+            is_shared_password,
+        ) {
+            PeerConfigPasswordUpdate::Remembered => {
                 log::debug!("remember password of {}", self.id);
             }
-        } else {
-            if self.password_source.is_personal_ab(&password) {
-                // sync personal ab password to recent automatically
-                config.password = password.clone();
-                log::debug!("save ab password of {} to recent", self.id);
-            } else if !password0.is_empty() {
-                config.password = Default::default();
-                log::debug!("remove password of {}", self.id);
+            PeerConfigPasswordUpdate::Removed => {
+                log::debug!("remove non-persistent address-book password of {}", self.id);
             }
+            PeerConfigPasswordUpdate::Unchanged => {}
         }
         if let Some((_, b, c)) = self.other_server.as_ref() {
             if b != PUBLIC_SERVER {
@@ -2581,7 +2803,7 @@ impl LoginConfigHandler {
             // sync connected password to personal ab automatically if it is not shared password
             if !config.password.is_empty()
                 && !self.password_source.is_shared_ab(&password, &hash)
-                && !self.password_source.is_personal_ab(&password)
+                && !self.password_source.is_personal_ab_source()
             {
                 let hash = base64::encode(config.password.clone(), base64::Variant::Original);
                 let evt: HashMap<&str, String> = HashMap::from([
@@ -2654,34 +2876,8 @@ impl LoginConfigHandler {
             (my_id, self.id.clone())
         };
         let mut avatar = get_builtin_option(keys::OPTION_AVATAR);
-        if avatar.is_empty() {
-            avatar = serde_json::from_str::<serde_json::Value>(&LocalConfig::get_option(
-                "user_info",
-            ))
-            .ok()
-            .and_then(|x| {
-                x.get("avatar")
-                    .and_then(|x| x.as_str())
-                    .map(|x| x.trim().to_owned())
-            })
-            .unwrap_or_default();
-        }
         avatar = resolve_avatar_url(avatar);
         let mut display_name = get_builtin_option(keys::OPTION_DISPLAY_NAME);
-        if display_name.is_empty() {
-            display_name =
-                serde_json::from_str::<serde_json::Value>(&LocalConfig::get_option("user_info"))
-                    .map(|x| {
-                        x.get("display_name")
-                            .and_then(|x| x.as_str())
-                            .map(|x| x.trim())
-                            .filter(|x| !x.is_empty())
-                            .or_else(|| x.get("name").and_then(|x| x.as_str()))
-                            .map(|x| x.to_owned())
-                            .unwrap_or_default()
-                    })
-                    .unwrap_or_default();
-        }
         if display_name.is_empty() {
             display_name = crate::username();
         }
@@ -2783,12 +2979,27 @@ impl LoginConfigHandler {
         if self.password.is_empty() {
             return None;
         }
-        serde_json::to_string(&ConnToken {
-            password: self.password.clone(),
-            password_source: self.password_source.clone(),
-            session_id: self.session_id,
-        })
-        .ok()
+        let personal_hash_capability = if self.password_source.is_personal_ab_source() {
+            Some(
+                crate::hbbs_http::auth_binding::personal_hash_connection_capability(
+                    &self.id,
+                    &self.password,
+                )?,
+            )
+        } else {
+            None
+        };
+        register_native_conn_token(
+            ConnToken {
+                peer_id: self.id.clone(),
+                password: self.password.clone(),
+                password_source: self.password_source.clone(),
+                session_id: self.session_id,
+                personal_hash_capability,
+                issued_at: std::time::Instant::now(),
+            },
+            std::time::Instant::now(),
+        )
     }
 
     pub fn get_id(&self) -> &str {
@@ -3421,11 +3632,7 @@ async fn consume_local_switch_sides_uuid(id: &str, uuid: &Uuid) -> bool {
         return false;
     }
     match conn.next_timeout(1000).await {
-        Ok(Some(crate::ipc::Data::SwitchSidesUuid(
-            returned_uuid,
-            returned_id,
-            Some(true),
-        ))) => {
+        Ok(Some(crate::ipc::Data::SwitchSidesUuid(returned_uuid, returned_id, Some(true)))) => {
             returned_uuid == uuid && returned_id == id
         }
         _ => false,
@@ -3464,14 +3671,32 @@ pub async fn handle_hash(
                 } else {
                     lc.write().unwrap().allow_switch_back_once();
                     send_switch_login_request(lc.clone(), peer, uuid).await;
-                    lc.write().unwrap().password_source = Default::default();
+                    finish_passwordless_switch(&mut lc.write().unwrap().password_source);
                     return;
                 }
             }
         }
     }
-    // last password
-    let mut password = lc.read().unwrap().password.clone();
+    // 上一次来自 personal 地址簿的 hash 必须重新经过当前代 allowlist 校验。
+    let previous_personal_hash = lc.read().unwrap().password_source.is_personal_ab_source();
+    let mut password = if previous_personal_hash {
+        let peer_id = lc.read().unwrap().id.clone();
+        match crate::hbbs_http::auth_binding::personal_hash_for_peer(&peer_id) {
+            Some(hash_password) => {
+                lc.write().unwrap().password_source =
+                    PasswordSource::PersonalAb(hash_password.clone());
+                hash_password
+            }
+            None => {
+                let mut login = lc.write().unwrap();
+                login.password.clear();
+                login.password_source = Default::default();
+                Vec::new()
+            }
+        }
+    } else {
+        lc.read().unwrap().password.clone()
+    };
     // preset password
     if password.is_empty() {
         if !password_preset.is_empty() {
@@ -3497,17 +3722,25 @@ pub async fn handle_hash(
         }
     }
     // peer config password
-    if password.is_empty() {
-        password = lc.read().unwrap().config.password.clone();
+    if password.is_empty() && !previous_personal_hash {
+        password = peer_config_password_candidate(&lc.read().unwrap().config);
         if !password.is_empty() {
             lc.write().unwrap().password_source = Default::default();
         }
     }
-    // personal ab password
+    // personal 地址簿 hash 只允许来自当前 native 认证代的进程内表，
+    // 绝不回读 config::Ab 或其他磁盘缓存。
     if password.is_empty() {
-        try_get_password_from_personal_ab(lc.clone(), &mut password);
+        let peer_id = lc.read().unwrap().id.clone();
+        if let Some(hash_password) =
+            crate::hbbs_http::auth_binding::personal_hash_for_peer(&peer_id)
+        {
+            if !hash_password.is_empty() {
+                password = hash_password.clone();
+                lc.write().unwrap().password_source = PasswordSource::PersonalAb(hash_password);
+            }
+        }
     }
-
     if password.is_empty() {
         let p = crate::ui_interface::get_builtin_option(keys::OPTION_DEFAULT_CONNECT_PASSWORD);
         if !p.is_empty() {
@@ -3559,31 +3792,6 @@ pub async fn handle_hash(
     lc.write().unwrap().hash = hash;
 }
 
-#[inline]
-fn try_get_password_from_personal_ab(lc: Arc<RwLock<LoginConfigHandler>>, password: &mut Vec<u8>) {
-    let access_token = LocalConfig::get_option("access_token");
-    let ab = config::Ab::load();
-    if !access_token.is_empty() && access_token == ab.access_token {
-        let id = lc.read().unwrap().id.clone();
-        if let Some(ab) = ab.ab_entries.iter().find(|a| a.personal()) {
-            if let Some(p) = ab
-                .peers
-                .iter()
-                .find_map(|p| if p.id == id { Some(p) } else { None })
-            {
-                if let Ok(hash_password) = base64::decode(p.hash.clone(), base64::Variant::Original)
-                {
-                    if !hash_password.is_empty() {
-                        *password = hash_password.clone();
-                        lc.write().unwrap().password_source =
-                            PasswordSource::PersonalAb(hash_password);
-                    }
-                }
-            }
-        }
-    }
-}
-
 /// Send login message to peer.
 ///
 /// # Arguments
@@ -3626,9 +3834,27 @@ pub async fn handle_login_from_ui(
     peer: &mut Stream,
 ) {
     let mut hash_password = if password.is_empty() {
-        let mut password2 = lc.read().unwrap().password.clone();
-        if password2.is_empty() {
-            password2 = lc.read().unwrap().config.password.clone();
+        let previous_personal_hash = lc.read().unwrap().password_source.is_personal_ab_source();
+        let mut password2 = if previous_personal_hash {
+            let peer_id = lc.read().unwrap().id.clone();
+            match crate::hbbs_http::auth_binding::personal_hash_for_peer(&peer_id) {
+                Some(hash_password) => {
+                    lc.write().unwrap().password_source =
+                        PasswordSource::PersonalAb(hash_password.clone());
+                    hash_password
+                }
+                None => {
+                    let mut login = lc.write().unwrap();
+                    login.password.clear();
+                    login.password_source = Default::default();
+                    Vec::new()
+                }
+            }
+        } else {
+            lc.read().unwrap().password.clone()
+        };
+        if password2.is_empty() && !previous_personal_hash {
+            password2 = peer_config_password_candidate(&lc.read().unwrap().config);
             if !password2.is_empty() {
                 lc.write().unwrap().password_source = Default::default();
             }
@@ -3670,6 +3896,461 @@ async fn send_switch_login_request(
         ..Default::default()
     });
     allow_err!(peer.send(&msg_out).await);
+}
+
+#[cfg(test)]
+mod personal_hash_client_tests {
+    use super::*;
+
+    struct StoredPeerConfig(String);
+
+    impl StoredPeerConfig {
+        fn new() -> Self {
+            Self(format!(
+                "issue9-personal-hash-test-{}",
+                hbb_common::uuid::Uuid::new_v4()
+            ))
+        }
+    }
+
+    impl Drop for StoredPeerConfig {
+        fn drop(&mut self) {
+            PeerConfig::remove(&self.0);
+        }
+    }
+
+    #[test]
+    fn 旧版未标记_peer_密码在认证前即被拒绝并从磁盘隔离() {
+        let peer = StoredPeerConfig::new();
+        let legacy_hash = b"legacy-personal-hash-on-disk".to_vec();
+        let mut seeded = PeerConfig {
+            password: legacy_hash,
+            ..Default::default()
+        };
+        seeded.options.remove(PEER_PASSWORD_PROVENANCE_KEY);
+        seeded.store(&peer.0);
+
+        let loaded = PeerConfig::load(&peer.0);
+        // 候选读取本身就拒绝未标记值，因此即使后续持久化清理失败也不能用于认证。
+        assert!(peer_config_password_candidate(&loaded).is_empty());
+
+        let mut login = LoginConfigHandler::default();
+        login.initialize(
+            peer.0.clone(),
+            ConnType::DEFAULT_CONN,
+            None,
+            false,
+            None,
+            None,
+            None,
+        );
+        assert!(login.config.password.is_empty());
+        assert!(!login.remember);
+        assert!(peer_config_password_candidate(&login.config).is_empty());
+
+        let persisted = PeerConfig::load(&peer.0);
+        assert!(persisted.password.is_empty());
+        assert!(!persisted.options.contains_key(PEER_PASSWORD_PROVENANCE_KEY));
+    }
+
+    #[test]
+    fn 密码来源标记的大小写与空白变体均被通用桥拒绝() {
+        let peer = StoredPeerConfig::new();
+        let legacy_hash = b"legacy-unmarked-password".to_vec();
+        let mut seeded = PeerConfig {
+            password: legacy_hash,
+            ..Default::default()
+        };
+        seeded.options.insert(
+            " PeEr-PASSWORD-Provenance ".to_owned(),
+            PEER_PASSWORD_PROVENANCE_EXPLICIT_V1.to_owned(),
+        );
+        seeded.store(&peer.0);
+
+        for key in [
+            PEER_PASSWORD_PROVENANCE_KEY,
+            "PEER-PASSWORD-PROVENANCE",
+            " peer-password-provenance ",
+        ] {
+            assert!(protected_peer_option_key(key));
+            assert!(!crate::ui_interface::option_bridge_allows_key(key));
+            crate::ui_interface::set_peer_option(
+                peer.0.clone(),
+                key.to_owned(),
+                PEER_PASSWORD_PROVENANCE_EXPLICIT_V1.to_owned(),
+            );
+        }
+
+        let mut handler = LoginConfigHandler {
+            id: peer.0.clone(),
+            config: PeerConfig::load(&peer.0),
+            ..Default::default()
+        };
+        handler.set_option(
+            " PEER-password-provenance ".to_owned(),
+            PEER_PASSWORD_PROVENANCE_EXPLICIT_V1.to_owned(),
+        );
+        assert!(handler
+            .toggle_option("peer-PASSWORD-provenance".to_owned())
+            .is_none());
+        assert!(handler.get_option(" Peer-Password-Provenance ").is_empty());
+
+        let mut persisted = PeerConfig::load(&peer.0);
+        assert!(peer_config_password_candidate(&persisted).is_empty());
+        clear_peer_config_password(&mut persisted);
+        assert!(persisted
+            .options
+            .keys()
+            .all(|key| !protected_peer_option_key(key)));
+    }
+
+    #[test]
+    fn 新版显式记住的_peer_密码带标记并可跨初始化使用() {
+        let peer = StoredPeerConfig::new();
+        let explicit_hash = b"explicit-user-password-hash".to_vec();
+        let mut seeded = PeerConfig {
+            password: explicit_hash.clone(),
+            ..Default::default()
+        };
+        mark_peer_config_password_explicit(&mut seeded);
+        seeded.store(&peer.0);
+
+        let mut login = LoginConfigHandler::default();
+        login.initialize(
+            peer.0.clone(),
+            ConnType::DEFAULT_CONN,
+            None,
+            false,
+            None,
+            None,
+            None,
+        );
+        assert!(login.remember);
+        assert_eq!(peer_config_password_candidate(&login.config), explicit_hash);
+        assert!(peer_config_has_explicit_password(&PeerConfig::load(
+            &peer.0
+        )));
+    }
+
+    #[test]
+    fn personal_来源不会写标记或覆盖已标记显式密码() {
+        let explicit_hash = b"existing-explicit-hash".to_vec();
+        let personal_hash = b"current-personal-hash".to_vec();
+        let source = PasswordSource::PersonalAb(personal_hash.clone());
+        let mut explicit = PeerConfig {
+            password: explicit_hash.clone(),
+            ..Default::default()
+        };
+        mark_peer_config_password_explicit(&mut explicit);
+
+        assert_eq!(
+            update_peer_config_password(&mut explicit, &personal_hash, &source, true, false),
+            PeerConfigPasswordUpdate::Unchanged
+        );
+        assert_eq!(explicit.password, explicit_hash);
+        assert!(peer_config_has_explicit_password(&explicit));
+
+        let mut empty = PeerConfig::default();
+        assert_eq!(
+            update_peer_config_password(&mut empty, &personal_hash, &source, true, false),
+            PeerConfigPasswordUpdate::Unchanged
+        );
+        assert!(empty.password.is_empty());
+        assert!(!empty.options.contains_key(PEER_PASSWORD_PROVENANCE_KEY));
+    }
+
+    #[test]
+    fn 无密码切换保留_personal_来源() {
+        let hash = b"process-bound-personal-hash".to_vec();
+        let mut login = LoginConfigHandler {
+            password: hash.clone(),
+            password_source: PasswordSource::PersonalAb(hash.clone()),
+            ..Default::default()
+        };
+
+        finish_passwordless_switch(&mut login.password_source);
+        assert_eq!(
+            login.password_source,
+            PasswordSource::PersonalAb(hash.clone())
+        );
+    }
+
+    #[test]
+    fn 无密码切换仍清除非_personal_来源() {
+        let mut source = PasswordSource::SharedAb("shared".to_owned());
+        finish_passwordless_switch(&mut source);
+        assert_eq!(source, PasswordSource::Undefined);
+    }
+
+    fn test_conn_token(
+        peer_id: &str,
+        password: &[u8],
+        password_source: PasswordSource,
+        issued_at: std::time::Instant,
+    ) -> ConnToken {
+        ConnToken {
+            peer_id: peer_id.to_owned(),
+            password: password.to_vec(),
+            password_source,
+            session_id: 42,
+            personal_hash_capability: None,
+            issued_at,
+        }
+    }
+
+    #[test]
+    fn opaque_连接能力拒绝伪造_换_peer_重放_过期并限制容量() {
+        clear_native_conn_token_registry();
+        let now = std::time::Instant::now();
+        let peer = StoredPeerConfig::new();
+        let secret = b"native-only-password";
+        let forged = serde_json::json!({
+            "password": secret,
+            "password_source": "Undefined",
+            "session_id": 42,
+        })
+        .to_string();
+
+        let mut forged_login = LoginConfigHandler::default();
+        forged_login.initialize(
+            peer.0.clone(),
+            ConnType::DEFAULT_CONN,
+            None,
+            false,
+            None,
+            None,
+            Some(forged),
+        );
+        assert!(forged_login.password.is_empty());
+        assert_eq!(forged_login.password_source, PasswordSource::Undefined);
+
+        let wrong_peer_capability = register_native_conn_token(
+            test_conn_token(&peer.0, secret, PasswordSource::Undefined, now),
+            now,
+        )
+        .expect("应签发换 peer 测试能力");
+        assert!(consume_native_conn_token_with_validator(
+            &wrong_peer_capability,
+            "other-peer",
+            now,
+            |_| true,
+        )
+        .is_none());
+        assert!(consume_native_conn_token_with_validator(
+            &wrong_peer_capability,
+            &peer.0,
+            now,
+            |_| true,
+        )
+        .is_none());
+
+        let one_shot = register_native_conn_token(
+            test_conn_token(&peer.0, secret, PasswordSource::Undefined, now),
+            now,
+        )
+        .expect("应签发一次性能力");
+        assert!(hbb_common::uuid::Uuid::parse_str(&one_shot).is_ok());
+        assert!(!one_shot.contains("native-only-password"));
+        let consumed = consume_native_conn_token_with_validator(&one_shot, &peer.0, now, |_| true)
+            .expect("首次消费应成功");
+        assert_eq!(consumed.password, secret);
+        assert_eq!(consumed.session_id, 42);
+        assert!(
+            consume_native_conn_token_with_validator(&one_shot, &peer.0, now, |_| true,).is_none()
+        );
+
+        let issuer = LoginConfigHandler {
+            id: peer.0.clone(),
+            password: secret.to_vec(),
+            password_source: PasswordSource::Undefined,
+            session_id: 42,
+            ..Default::default()
+        };
+        let initialize_capability = issuer.get_conn_token().expect("应签发 opaque 连接能力");
+        assert!(hbb_common::uuid::Uuid::parse_str(&initialize_capability).is_ok());
+        assert!(!initialize_capability.contains("native-only-password"));
+        let mut initialized = LoginConfigHandler::default();
+        initialized.initialize(
+            peer.0.clone(),
+            ConnType::DEFAULT_CONN,
+            None,
+            false,
+            None,
+            None,
+            Some(initialize_capability.clone()),
+        );
+        assert_eq!(initialized.password, secret);
+        assert_eq!(initialized.session_id, 42);
+        let mut replayed = LoginConfigHandler::default();
+        replayed.initialize(
+            peer.0.clone(),
+            ConnType::DEFAULT_CONN,
+            None,
+            false,
+            None,
+            None,
+            Some(initialize_capability),
+        );
+        assert!(replayed.password.is_empty());
+        assert_ne!(replayed.session_id, 0);
+
+        let expired = register_native_conn_token(
+            test_conn_token(&peer.0, secret, PasswordSource::Undefined, now),
+            now,
+        )
+        .expect("应签发过期测试能力");
+        assert!(consume_native_conn_token_with_validator(
+            &expired,
+            &peer.0,
+            now + CONN_TOKEN_TTL + std::time::Duration::from_millis(1),
+            |_| true,
+        )
+        .is_none());
+
+        let missing_personal_provenance = register_native_conn_token(
+            test_conn_token(
+                &peer.0,
+                secret,
+                PasswordSource::PersonalAb(secret.to_vec()),
+                now,
+            ),
+            now,
+        )
+        .expect("应签发缺失来源证明的测试能力");
+        assert!(consume_native_conn_token_with_validator(
+            &missing_personal_provenance,
+            &peer.0,
+            now,
+            |_| true,
+        )
+        .is_none());
+
+        let auth_root = std::env::temp_dir().join(format!(
+            "rustdesk-conn-token-auth-{}",
+            hbb_common::uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&auth_root).expect("应创建连接能力认证测试目录");
+        let authority =
+            crate::hbbs_http::auth_binding::AuthAuthorityAnchor::from_root_and_identity(
+                &auth_root,
+                b"conn-token-auth-install",
+            )
+            .expect("应创建连接能力测试 authority");
+        let mut binding =
+            crate::hbbs_http::auth_binding::AuthBinding::open(authority).expect("应打开认证状态");
+        let attempt = binding
+            .begin_auth_attempt("https://example.com")
+            .expect("应开始登录");
+        binding
+            .commit_auth_attempt(
+                &attempt,
+                "token".to_owned(),
+                crate::hbbs_http::auth_binding::AuthSafeUser {
+                    id: Some(1),
+                    name: "alice".to_owned(),
+                    display_name: "Alice".to_owned(),
+                    avatar: String::new(),
+                    email: String::new(),
+                    note: String::new(),
+                    status: 1,
+                    is_admin: false,
+                    verifier: String::new(),
+                },
+                None,
+            )
+            .expect("应提交登录");
+        let handle = binding
+            .credentialed_request_handle("https://example.com/api/ab")
+            .expect("应创建地址簿请求 handle");
+        binding
+            .set_address_book_capability(
+                &handle,
+                crate::hbbs_http::auth_binding::AddressBookCapability::Legacy,
+                false,
+            )
+            .expect("应确认 legacy 能力");
+        let fence = binding
+            .personal_hash_request_fence(&handle)
+            .expect("应捕获 personal 请求栅栏");
+        let personal_hash = b"native-personal-hash".to_vec();
+        let receipt = binding
+            .issue_personal_hash_receipt(
+                &handle,
+                fence,
+                crate::hbbs_http::auth_binding::PersonalHashSource::LegacyPersonal,
+                std::collections::BTreeMap::from([(peer.0.clone(), personal_hash.clone())]),
+            )
+            .expect("应签发 personal receipt")
+            .expect("应获得 personal receipt");
+        assert!(binding
+            .commit_personal_hash_receipt(&handle, &receipt)
+            .expect("应提交 personal receipt"));
+        let personal_capability = binding
+            .personal_hash_connection_capability(&peer.0, &personal_hash)
+            .expect("应签发 personal 连接能力证明");
+        let current_personal = register_native_conn_token(
+            ConnToken {
+                peer_id: peer.0.clone(),
+                password: personal_hash.clone(),
+                password_source: PasswordSource::PersonalAb(personal_hash.clone()),
+                session_id: 43,
+                personal_hash_capability: Some(personal_capability.clone()),
+                issued_at: now,
+            },
+            now,
+        )
+        .expect("应签发 personal opaque capability");
+        assert!(consume_native_conn_token_with_validator(
+            &current_personal,
+            &peer.0,
+            now,
+            |capability| binding.personal_hash_connection_capability_is_current(capability),
+        )
+        .is_some());
+
+        let stale_personal = register_native_conn_token(
+            ConnToken {
+                peer_id: peer.0.clone(),
+                password: personal_hash.clone(),
+                password_source: PasswordSource::PersonalAb(personal_hash),
+                session_id: 44,
+                personal_hash_capability: Some(personal_capability),
+                issued_at: now,
+            },
+            now,
+        )
+        .expect("应签发 mutation 前 personal capability");
+        assert!(binding
+            .begin_personal_hash_mutation_if_current(&handle, None)
+            .expect("应开始 mutation"));
+        assert!(binding
+            .finish_personal_hash_mutation_if_current(&handle)
+            .expect("应结束 mutation"));
+        assert!(consume_native_conn_token_with_validator(
+            &stale_personal,
+            &peer.0,
+            now,
+            |capability| binding.personal_hash_connection_capability_is_current(capability),
+        )
+        .is_none());
+        drop(binding);
+        std::fs::remove_dir_all(&auth_root).expect("应清理连接能力认证测试目录");
+
+        clear_native_conn_token_registry();
+        for _ in 0..MAX_CONN_TOKEN_CAPABILITIES {
+            assert!(register_native_conn_token(
+                test_conn_token(&peer.0, secret, PasswordSource::Undefined, now),
+                now,
+            )
+            .is_some());
+        }
+        assert!(register_native_conn_token(
+            test_conn_token(&peer.0, secret, PasswordSource::Undefined, now),
+            now,
+        )
+        .is_none());
+        clear_native_conn_token_registry();
+    }
 }
 
 /// Interface for client to send data and commands.

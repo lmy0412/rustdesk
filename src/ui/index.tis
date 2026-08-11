@@ -354,14 +354,19 @@ class Enhancements: Reactor.Component {
 
 function getUserName() {
     try {
-        return JSON.parse(handler.get_local_option("user_info")).name;
+        var snapshot = JSON.parse(handler.get_sciter_auth_snapshot());
+        return snapshot.session ? (snapshot.session.user.name || '') : '';
     } catch(e) {}
     return '';
 }
 
 function getAccountLabelWithHandle() {
     try {
-        var user = JSON.parse(handler.get_local_option("user_info"));
+        var snapshot = JSON.parse(handler.get_sciter_auth_snapshot());
+        if (!snapshot.session) {
+            return '';
+        }
+        var user = snapshot.session.user;
         var username = (user.name || '').trim();
         if (!username) {
             return '';
@@ -410,11 +415,13 @@ function open_custom_server_dialog() {
                         return;
                     }
                 }
-                configOptions["custom-rendezvous-server"] = id;
-                configOptions["relay-server"] = relay;
-                configOptions["api-server"] = api;
-                configOptions["key"] = key;
-                handler.set_options(configOptions);
+                if (!handler.set_server_config(id, relay, api, key)) {
+                    if (typeof show_progress === 'function') {
+                        show_progress(false, translate("Invalid server configuration"));
+                    }
+                    return;
+                }
+                if (myIdMenu) myIdMenu.update();
                 if (typeof show_progress === 'function') show_progress(-1);
             }, 260, get_msgbox_width());
 }
@@ -510,7 +517,7 @@ class MyIdMenu: Reactor.Component {
     }
 
     function renderPop() {
-        var accountLabel = handler.get_local_option("access_token") ? getAccountLabelWithHandle() : '';
+        var accountLabel = getAccountLabelWithHandle();
         return <popup>
             <menu.context #config-options>
                 {!disable_settings && <li #enable-keyboard><span>{svg_checkmark}</span>{translate('Enable keyboard/mouse')}</li>}
@@ -1503,20 +1510,6 @@ function check_if_overlay() {
 
 checkConnectStatus();
 
-function set_local_user_info(user) {
-    var user_info = {name: user.name};
-    if (user.display_name) {
-        user_info.display_name = user.display_name;
-    }
-    if (user.avatar) {
-        user_info.avatar = user.avatar;
-    }
-    if (user.status) {
-        user_info.status = user.status;
-    }
-    handler.set_local_option("user_info", JSON.stringify(user_info));
-}
-
 function login() {
     var name0 = getUserName();
     var pass0 = '';
@@ -1526,38 +1519,39 @@ function login() {
         </div>, "", function(res=null, show_progress) {
         if (!res) return;
         show_progress();
-        var name = (res.username || '').trim();
+        var name = res.username || '';
         if (!name) {
             show_progress(false, translate("Username missed"));
             return " ";
         }
-        var pass = (res.password || '').trim();
+        var pass = res.password || '';
         if (!pass) {
             show_progress(false, translate("Password missed"));
             return " ";
         }
         abLoading = true;
         var url = handler.get_api_server();
-        httpRequest(url + "/api/login", #post, {username: name, password: pass, id: my_id, uuid: handler.get_uuid(), type: 'account', deviceInfo: getDeviceInfo()}, function(data) {
-            if (data.error) {
-                abLoading = false;
-                var err = translate(data.error);
-                show_progress(false, err);
-                return;
-            }
-            if (data.type == 'email_check') {
+        sciterAuthLogin({username: name, password: pass, id: my_id, uuid: handler.get_uuid(), type: 'account', deviceInfo: getDeviceInfo()}, function(data) {
+            if (data.kind == 'challenge') {
                 abLoading = false;
                 show_progress(-1);
                 on_2fa_check(data);
                 return;
             }
-            handler.set_local_option("access_token", data.access_token);
-            set_local_user_info(data.user);
+            if (data.kind != 'authenticated') {
+                abLoading = false;
+                show_progress(false, translate("Error"));
+                return;
+            }
             show_progress(-1);
             myIdMenu.update();
             getAb();
         }, function(err, status) {
             abLoading = false;
+            if (status == -1) {
+                show_progress(-1);
+                return;
+            }
             err = translate(err);
             if (url.indexOf('rustdesk') < 0) err = url + ', ' + err;
             show_progress(false, err);
@@ -1569,7 +1563,13 @@ function login() {
 function on_2fa_check(last_msg) {
     const isEmailCheck = !last_msg.tfa_type || last_msg.tfa_type == 'email_check';
     const secret = last_msg.secret;
-    const emailHint = last_msg.user.email;
+    const nativeAttempt = last_msg.native_attempt || '';
+    var nativeJobId = last_msg.native_job_id || '';
+    const emailHint = last_msg.user ? (last_msg.user.email || '') : '';
+    if (!nativeAttempt || !nativeJobId || !last_msg.user || !(last_msg.user.name || '')) {
+        msgbox("custom-error", translate('Error'), translate('Error'));
+        return;
+    }
 
     msgbox("custom-2fa-verification-code", translate('Verification code'), <div .form .set-password> 
             { isEmailCheck && <div><span>{translate('Email')}:</span><span>{emailHint}</span></div> }
@@ -1577,7 +1577,10 @@ function on_2fa_check(last_msg) {
             { isEmailCheck && <div style="font-size:0.9em; margin-bottom:1em;">{translate('verification_tip')}</div> }
         </div>, "", 
         function(res=null, show_progress) {
-            if (!res) return;
+            if (!res) {
+                handler.cancel_sciter_auth_attempt(nativeAttempt);
+                return;
+            }
             show_progress();
             var code = (res.verification_code || '').trim();
             if (!code || code.length < 6) {
@@ -1596,26 +1599,37 @@ function on_2fa_check(last_msg) {
                 secret: secret,
                 deviceInfo: getDeviceInfo()
             };
-            httpRequest(url + "/api/login", #post, loginData, 
+            var nextJobId = sciterAuthLogin(loginData,
                 function(data) {
-                    if (data.error) {
+                    if (data.kind == 'challenge') {
                         abLoading = false;
-                        show_progress(false, data.error);
+                        show_progress(-1);
+                        on_2fa_check(data);
                         return;
                     }
-                    handler.set_local_option("access_token", data.access_token);
-                    set_local_user_info(data.user);
+                    if (data.kind != 'authenticated') {
+                        abLoading = false;
+                        show_progress(false, translate("Error"));
+                        return;
+                    }
                     show_progress(-1);
                     myIdMenu.update();
                     getAb();
                 },
                 function(err, status) {
                     abLoading = false;
+                    if (status == -1) {
+                        show_progress(-1);
+                        return;
+                    }
                     err = translate(err);
                     if (url.indexOf('rustdesk') < 0) err = url + ', ' + err;
                     show_progress(false, err);
-                }
+                },
+                nativeAttempt,
+                nativeJobId
             );
+            if (nextJobId) nativeJobId = nextJobId;
             return " ";
         },
         msgbox_default_height,
@@ -1623,9 +1637,7 @@ function on_2fa_check(last_msg) {
     );
 }
 
-function reset_token() {
-    handler.set_local_option("access_token", "");
-    handler.set_local_option("user_info", "");
+function reset_auth_view() {
     handler.set_local_option("selected-tags", "");
     myIdMenu.update();
     resetAb();
@@ -1635,46 +1647,54 @@ function reset_token() {
 }
 
 function logout() {
-    var url = handler.get_api_server();
-    httpRequest(url + "/api/logout", #post, {id: my_id, uuid: handler.get_uuid()}, function(data) {
+    var jobId = handler.start_sciter_auth_logout();
+    if (!jobId) {
+        msgbox("custom-error", translate('Error'), translate('Error'));
+        return;
+    }
+    reset_auth_view();
+    waitSciterAuthJob(jobId, function(data) {
+        if (data.kind == "logged_out_local_only" || data.kind == "logout_pending") {
+            msgbox("custom-error", translate('Error'), data.message || translate('Error'));
+        }
     }, function(err, status) {
-        msgbox("custom-error", translate('Error'), err);
-    }, getHttpHeaders());
-    reset_token();
+        if (status != -1) {
+            msgbox("custom-error", translate('Error'), err);
+        }
+    });
 }
 
 function refreshCurrentUser() {
-    var token = handler.get_local_option("access_token");
-    if (!token) { return; }
+    var snapshot;
+    try {
+        snapshot = JSON.parse(handler.get_sciter_auth_snapshot());
+    } catch(e) {
+        return;
+    }
+    if (!snapshot.session) { return; }
     abLoading = true;
     abError = "";
     app.update();
-    httpRequest(handler.get_api_server() + "/api/currentUser", #post, {id: my_id, uuid: handler.get_uuid()}, function(data) {
+    sciterAuthRequest("current_user", {id: my_id, uuid: handler.get_uuid()}, function(result) {
+        var data = result.data || {};
         if (data.error) {
-            if (data.error == 'Invalid token') {
-              reset_token();
-            }
             handleAbError(data.error);
             return;
         }
-	if (!handler.verify_login(data.verifier, token)) {
-          handleAbError("Please update your self-hosting server Pro to latest version");
-          return;
-        }
-        set_local_user_info(data);
         myIdMenu.update();
         getAb();
     }, function(err, status) {
-        if (status == 401 || status == 400) {
-            reset_token();
+        if (status == -1) {
+            abLoading = false;
+            app.update();
+            return;
+        }
+        if (status == 401) {
+            reset_auth_view();
         }
         handleAbError(err);
-    }, getHttpHeaders());
+    });
 } 
-
-function getHttpHeaders() {
-    return "Authorization: Bearer " + handler.get_local_option("access_token");
-}
 
 function getDeviceInfo() {
     return JSON.parse(handler.get_login_device_info());

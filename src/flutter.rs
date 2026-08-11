@@ -23,7 +23,7 @@ use std::{
     os::raw::{c_char, c_int, c_void},
     str::FromStr,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, RwLock,
     },
 };
@@ -48,6 +48,8 @@ lazy_static::lazy_static! {
     pub(crate) static ref CUR_SESSION_ID: RwLock<SessionID> = Default::default(); // For desktop only
     static ref GLOBAL_EVENT_STREAM: RwLock<HashMap<String, StreamSink<String>>> = Default::default(); // rust to dart event channel
 }
+static MAIN_EVENT_SINK_GENERATION: AtomicU64 = AtomicU64::new(0);
+static MAIN_ADDRESS_BOOK_CONSUMER_READY: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(target_os = "windows")]
 lazy_static::lazy_static! {
@@ -1859,11 +1861,58 @@ pub fn start_global_event_stream(s: StreamSink<String>, app_type: String) -> Res
             );
         }
     }
+    if app_type_values[0] == APP_TYPE_MAIN {
+        MAIN_ADDRESS_BOOK_CONSUMER_READY.store(0, Ordering::Release);
+        MAIN_EVENT_SINK_GENERATION
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+                generation.checked_add(1)
+            })
+            .map_err(|_| anyhow!("Global event sink generation is exhausted"))?;
+    }
     Ok(())
 }
 
 pub fn stop_global_event_stream(app_type: String) {
     let _ = GLOBAL_EVENT_STREAM.write().unwrap().remove(&app_type);
+    if app_type.split(',').next() == Some(APP_TYPE_MAIN) {
+        MAIN_ADDRESS_BOOK_CONSUMER_READY.store(0, Ordering::Release);
+        let _ = MAIN_EVENT_SINK_GENERATION.fetch_update(
+            Ordering::AcqRel,
+            Ordering::Acquire,
+            |generation| generation.checked_add(1),
+        );
+    }
+}
+
+pub fn address_book_consumer_registration() -> (u64, bool) {
+    let generation = MAIN_EVENT_SINK_GENERATION.load(Ordering::Acquire);
+    let present = GLOBAL_EVENT_STREAM
+        .read()
+        .unwrap()
+        .contains_key(APP_TYPE_MAIN);
+    (generation, present)
+}
+
+pub fn mark_address_book_consumer_ready(generation: u64) -> bool {
+    let (current, present) = address_book_consumer_registration();
+    if !present || generation == 0 || generation != current {
+        return false;
+    }
+    MAIN_ADDRESS_BOOK_CONSUMER_READY.store(generation, Ordering::Release);
+    let (confirmed, still_present) = address_book_consumer_registration();
+    if still_present && confirmed == generation {
+        true
+    } else {
+        MAIN_ADDRESS_BOOK_CONSUMER_READY.store(0, Ordering::Release);
+        false
+    }
+}
+
+pub fn is_address_book_consumer_ready() -> bool {
+    let (generation, present) = address_book_consumer_registration();
+    present
+        && generation != 0
+        && MAIN_ADDRESS_BOOK_CONSUMER_READY.load(Ordering::Acquire) == generation
 }
 
 #[inline]

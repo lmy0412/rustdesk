@@ -29,6 +29,9 @@ macro_rules! my_println{
 /// If it returns [`Some`], then the process will continue, and flutter gui will be started.
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub fn core_main() -> Option<Vec<String>> {
+    // 在读取 custom client、APP_NAME、license 或任一 Config 前冻结原生进程角色。
+    // Dart 侧随后传入的 appType 只作一致性检查，不能把子进程提升为主界面。
+    crate::hbbs_http::auth_binding::freeze_current_process_role();
     if !crate::common::global_init() {
         return None;
     }
@@ -504,13 +507,14 @@ pub fn core_main() -> Option<Vec<String>> {
                     };
                     if let Ok(lic) = crate::custom_server::get_custom_server_from_string(&name) {
                         if !lic.host.is_empty() {
-                            crate::ui_interface::set_option("key".into(), lic.key);
-                            crate::ui_interface::set_option(
-                                "custom-rendezvous-server".into(),
-                                lic.host,
-                            );
-                            crate::ui_interface::set_option("api-server".into(), lic.api);
-                            crate::ui_interface::set_option("relay-server".into(), lic.relay);
+                            // CLI/root 不持有 UI auth writer，可继续写既有 Config2；
+                            // 主界面收到权威 Options 时会先做认证协调再发布。
+                            let mut options = crate::ipc::get_options();
+                            options.insert("key".into(), lic.key);
+                            options.insert("custom-rendezvous-server".into(), lic.host);
+                            options.insert("api-server".into(), lic.api);
+                            options.insert("relay-server".into(), lic.relay);
+                            crate::ipc::set_options(options).ok();
                         }
                     }
                 } else {
@@ -567,7 +571,6 @@ pub fn core_main() -> Option<Vec<String>> {
                         "id": id,
                         "uuid": uuid,
                     });
-                    let header = "Authorization: Bearer ".to_owned() + &token;
                     if user_name.is_none()
                         && strategy_name.is_none()
                         && address_book_name.is_none()
@@ -621,7 +624,16 @@ pub fn core_main() -> Option<Vec<String>> {
                             body["device_name"] = serde_json::json!(name);
                         }
                         let url = crate::ui_interface::get_api_server() + "/api/devices/cli";
-                        match crate::post_request_sync(url, body.to_string(), &header) {
+                        let request = crate::common::StrictHttpRequest::new(
+                            crate::common::StrictHttpMethod::Post,
+                            url,
+                        )
+                        .json_body(body.to_string());
+                        match crate::common::strict_http_request_one_shot_bearer_blocking(
+                            request, token,
+                        )
+                        .and_then(|response| response.ensure_success().map(|value| value.body))
+                        {
                             Err(err) => println!("{}", err),
                             Ok(text) => {
                                 if text.is_empty() {

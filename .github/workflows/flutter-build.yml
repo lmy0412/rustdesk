@@ -203,6 +203,9 @@ jobs:
               Write-Host "Ingore the printer driver error."
           }
 
+      - name: 测试 Issue9 原生认证状态存储
+        run: cargo test --locked --features flutter --test issue9_auth_state_store
+
       - name: find Runner.res
         # Windows: find Runner.res (compiled from ./flutter/windows/runner/Runner.rc), copy to ./Runner.res
         # Runner.rc does not contain actual version, but Runner.res does
@@ -1493,6 +1496,11 @@ jobs:
             fi
             echo $JOBS
             cargo build --locked --lib $JOBS --features hwcodec,flutter,unix-file-copy-paste --release
+            if [[ "${{ matrix.job.arch }}" == "x86_64" ]]; then
+              sed -i 's/\["cdylib"\]/["cdylib", "staticlib", "rlib"]/g' Cargo.toml
+              cargo test --locked --features flutter --test issue9_auth_state_store
+              sed -i 's/\["cdylib", "staticlib", "rlib"\]/["cdylib"]/g' Cargo.toml
+            fi
             rm -rf target/release/deps target/release/build
             rm -rf ~/.cargo
 

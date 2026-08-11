@@ -478,8 +478,9 @@ List<TTextMenu> toolbarControls(BuildContext context, String id, FFI ffi) {
       TTextMenu(
           child: Text(translate('Note')),
           onPressed: () async {
-            bool isLogin =
-                bind.mainGetLocalOption(key: 'access_token').isNotEmpty;
+            final isLogin = isWeb
+                ? bind.mainGetLocalOption(key: 'access_token').isNotEmpty
+                : gFFI.userModel.isLogin;
             if (!isLogin) {
               final res = await loginDialog();
               if (res != true) return;

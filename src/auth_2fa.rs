@@ -158,14 +158,26 @@ impl TelegramBot {
 pub async fn send_2fa_code_to_telegram(text: &str, bot: TelegramBot) -> ResultType<()> {
     let url = format!("https://api.telegram.org/bot{}/sendMessage", bot.token_str);
     let params = serde_json::json!({"chat_id": bot.chat_id, "text": text});
-    crate::post_request(url, params.to_string(), "").await?;
+    crate::common::strict_http_request_no_bearer(
+        crate::common::RequestSecurityClass::SensitiveNoBearerStrict,
+        crate::common::StrictHttpRequest::new(crate::common::StrictHttpMethod::Post, url)
+            .json_body(params.to_string()),
+    )
+    .await?
+    .ensure_success()?;
     Ok(())
 }
 
 pub fn get_chatid_telegram(bot_token: &str) -> ResultType<Option<String>> {
     let url = format!("https://api.telegram.org/bot{}/getUpdates", bot_token);
-    // because caller is in tokio runtime, so we must call post_request_sync in new thread.
-    let handle = std::thread::spawn(move || crate::post_request_sync(url, "".to_owned(), ""));
+    // 调用方位于 Tokio runtime，阻塞请求放到独立线程执行。
+    let handle = std::thread::spawn(move || {
+        crate::common::strict_http_request_no_bearer_blocking(
+            crate::common::RequestSecurityClass::SensitiveNoBearerStrict,
+            crate::common::StrictHttpRequest::new(crate::common::StrictHttpMethod::Get, url),
+        )
+        .and_then(|response| response.ensure_success().map(|value| value.body))
+    });
     let resp = handle.join().map_err(|_| anyhow!("Thread panicked"))??;
     let value = serde_json::from_str::<serde_json::Value>(&resp).map_err(|e| anyhow!(e))?;
 

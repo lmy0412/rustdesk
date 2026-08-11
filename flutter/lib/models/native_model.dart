@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:ffi';
 import 'dart:io';
@@ -35,6 +36,7 @@ class PlatformFFI {
   late RustdeskImpl _ffiBind;
   late String _appType;
   StreamEventHandler? _eventCallback;
+  int _pendingLogoutRetryRun = 0;
 
   PlatformFFI._();
 
@@ -60,7 +62,8 @@ class PlatformFFI {
   }
 
   bool registerEventHandler(
-      String eventName, String handlerName, HandleEvent handler, {bool replace = false}) {
+      String eventName, String handlerName, HandleEvent handler,
+      {bool replace = false}) {
     debugPrint('registerEventHandler $eventName $handlerName');
     var handlers = _eventHandlers[eventName];
     if (handlers == null) {
@@ -216,10 +219,67 @@ class PlatformFFI {
         appDir: _dir,
         customClientConfig: '',
       );
+      if (isMain) {
+        final packageInfo = await PackageInfo.fromPlatform();
+        await _ffiBind.mainAuthInitialize(
+          appType: kAppTypeMain,
+          packageIdentity: packageInfo.packageName,
+        );
+        schedulePendingLogoutRetries();
+      }
     } catch (e) {
       debugPrintStack(label: 'initialize failed: $e');
     }
     version = await getVersion();
+  }
+
+  void schedulePendingLogoutRetries() {
+    final run = ++_pendingLogoutRetryRun;
+    unawaited(_retryPendingLogouts(run));
+  }
+
+  Future<void> _retryPendingLogouts(int run) async {
+    int? expectedLogoutGeneration;
+    while (run == _pendingLogoutRetryRun) {
+      try {
+        final raw = await _ffiBind.mainAuthRetryPendingLogouts();
+        if (run != _pendingLogoutRetryRun) return;
+        final decoded = jsonDecode(raw);
+        if (decoded is! Map<String, dynamic>) return;
+        final snapshot = decoded['snapshot'];
+        if (snapshot is! Map<String, dynamic>) return;
+        final logoutGeneration = snapshot['logout_generation'];
+        final pendingCount = snapshot['pending_logout_count'];
+        if (logoutGeneration is! int || pendingCount is! int) return;
+        expectedLogoutGeneration ??= logoutGeneration;
+        if (logoutGeneration != expectedLogoutGeneration || pendingCount <= 0) {
+          return;
+        }
+
+        final now = DateTime.now().millisecondsSinceEpoch;
+        int? earliestRetry;
+        final outcomes = decoded['outcomes'];
+        if (outcomes is List) {
+          for (final outcome in outcomes) {
+            if (outcome is! Map) continue;
+            final retryAt = outcome['retry_after_unix_ms'];
+            if (outcome['outcome'] == 'retained' && retryAt is int) {
+              earliestRetry = earliestRetry == null || retryAt < earliestRetry
+                  ? retryAt
+                  : earliestRetry;
+            }
+          }
+        }
+        final requestedDelay =
+            earliestRetry == null ? 30000 : earliestRetry - now;
+        final boundedDelay = requestedDelay.clamp(1000, 15 * 60 * 1000).toInt();
+        await Future<void>.delayed(Duration(milliseconds: boundedDelay));
+      } catch (_) {
+        // 不记录错误对象或 native DTO，避免认证响应进入日志。
+        debugPrint('待处理远端注销重试失败，将稍后重试');
+        await Future<void>.delayed(const Duration(seconds: 30));
+      }
+    }
   }
 
   Future<bool> tryHandle(Map<String, dynamic> evt) async {

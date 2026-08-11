@@ -2,6 +2,7 @@ import 'dart:convert';
 import 'package:flutter/material.dart';
 import 'package:flutter_hbb/common.dart';
 import 'package:flutter_hbb/consts.dart';
+import 'package:flutter_hbb/models/state_generation_guard.dart';
 
 import 'package:flutter_hbb/models/peer_model.dart';
 
@@ -24,6 +25,7 @@ enum UserStatus { kDisabled, kNormal, kUnverified }
 // to-do: The UserPayload does not contain all the fields of the user.
 // Is all the fields of the user needed?
 class UserPayload {
+  int? id;
   String name = '';
   String displayName = '';
   String avatar = '';
@@ -34,7 +36,8 @@ class UserPayload {
   bool isAdmin = false;
 
   UserPayload.fromJson(Map<String, dynamic> json)
-      : name = json['name'] ?? '',
+      : id = json['id'] is int ? json['id'] : null,
+        name = json['name'] ?? '',
         displayName = json['display_name'] ?? '',
         avatar = json['avatar'] ?? '',
         email = json['email'] ?? '',
@@ -49,6 +52,7 @@ class UserPayload {
 
   Map<String, dynamic> toJson() {
     final Map<String, dynamic> map = {
+      if (id != null) 'id': id,
       'name': name,
       'display_name': displayName,
       'avatar': avatar,
@@ -63,6 +67,7 @@ class UserPayload {
 
   Map<String, dynamic> toGroupCacheJson() {
     final Map<String, dynamic> map = {
+      if (id != null) 'id': id,
       'name': name,
       'display_name': displayName,
     };
@@ -141,6 +146,9 @@ class LoginRequest {
   String? tfaCode;
   String? secret;
 
+  /// native 登录挑战的原始能力，仅回传 FFI，绝不能放入 HTTP 请求体。
+  String? nativeAttemptJson;
+
   LoginRequest(
       {this.username,
       this.password,
@@ -150,7 +158,8 @@ class LoginRequest {
       this.type,
       this.verificationCode,
       this.tfaCode,
-      this.secret});
+      this.secret,
+      this.nativeAttemptJson});
 
   Map<String, dynamic> toJson() {
     final Map<String, dynamic> data = <String, dynamic>{};
@@ -183,9 +192,27 @@ class LoginResponse {
   String? tfa_type;
   String? secret;
   UserPayload? user;
+  bool committed = false;
+  String? normalizedApiBase;
+  String? namespace;
+  String? cursorKey;
+  int? sessionEpoch;
+  String? sessionNonce;
+  String? nativeAttemptJson;
 
   LoginResponse(
-      {this.access_token, this.type, this.tfa_type, this.secret, this.user});
+      {this.access_token,
+      this.type,
+      this.tfa_type,
+      this.secret,
+      this.user,
+      this.committed = false,
+      this.normalizedApiBase,
+      this.namespace,
+      this.cursorKey,
+      this.sessionEpoch,
+      this.sessionNonce,
+      this.nativeAttemptJson});
 
   LoginResponse.fromJson(Map<String, dynamic> json) {
     access_token = json['access_token'];
@@ -193,13 +220,41 @@ class LoginResponse {
     tfa_type = json['tfa_type'];
     secret = json['secret'];
     user = json['user'] != null ? UserPayload.fromJson(json['user']) : null;
+    normalizedApiBase = json['normalized_api_base'] is String
+        ? json['normalized_api_base']
+        : null;
+    namespace = json['namespace'] is String ? json['namespace'] : null;
+    cursorKey = json['cursor_key'] is String ? json['cursor_key'] : null;
+    sessionEpoch = json['session_epoch'] is int ? json['session_epoch'] : null;
+    sessionNonce =
+        json['session_nonce'] is String ? json['session_nonce'] : null;
+    if (json['native_attempt'] != null) {
+      nativeAttemptJson =
+          nativeAuthAttemptOpaqueFromValue(json['native_attempt']);
+    }
+    committed = json['committed'] == true ||
+        (type == HttpType.kAuthResTypeToken &&
+            access_token == null &&
+            normalizedApiBase != null &&
+            namespace != null &&
+            cursorKey != null &&
+            sessionEpoch != null &&
+            sessionNonce != null);
   }
 }
 
 class RequestException implements Exception {
   int statusCode;
   String cause;
-  RequestException(this.statusCode, this.cause);
+  final String? nativeAttemptJson;
+  final bool recoverable;
+
+  RequestException(
+    this.statusCode,
+    this.cause, {
+    this.nativeAttemptJson,
+    this.recoverable = true,
+  });
 
   @override
   String toString() {

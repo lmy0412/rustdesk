@@ -1,6 +1,5 @@
 import 'dart:async';
 import 'dart:convert';
-import 'dart:math';
 
 import 'package:back_button_interceptor/back_button_interceptor.dart';
 import 'package:desktop_multi_window/desktop_multi_window.dart';
@@ -2700,9 +2699,41 @@ connect(BuildContext context, String id,
 }
 
 Map<String, String> getHttpHeaders() {
-  return {
-    'Authorization': 'Bearer ${bind.mainGetLocalOption(key: 'access_token')}'
-  };
+  if (isWeb) {
+    return {
+      'Authorization': 'Bearer ${bind.mainGetLocalOption(key: 'access_token')}'
+    };
+  }
+  // Native 端只传递无秘密标记，Bearer 由 Rust 的代际绑定严格传输注入。
+  return {'X-RustDesk-Native-Session': 'required'};
+}
+
+Future<String?> getAuthCacheNamespace() async {
+  try {
+    if (isWeb) {
+      final userInfo = bind.mainGetLocalOption(key: 'user_info');
+      final decoded = userInfo.isEmpty ? null : jsonDecode(userInfo);
+      final username =
+          decoded is Map<String, dynamic> ? decoded['name']?.toString() : null;
+      final base = await bind.mainGetApiServer();
+      if (username == null || username.isEmpty || base.isEmpty) {
+        return null;
+      }
+      return 'web:$base:$username';
+    }
+    final decoded = jsonDecode(await bind.mainAuthSnapshot());
+    if (decoded is! Map<String, dynamic>) {
+      return null;
+    }
+    final session = decoded['session'];
+    if (session is! Map<String, dynamic>) {
+      return null;
+    }
+    final cursorKey = session['cursor_key'];
+    return cursorKey is String && cursorKey.isNotEmpty ? cursorKey : null;
+  } catch (_) {
+    return null;
+  }
 }
 
 // Simple wrapper of built-in types for reference use.
@@ -3584,21 +3615,39 @@ Future<bool> setServerConfig(
       return false;
     }
   }
-  final oldApiServer = await bind.mainGetApiServer();
-
-  // should set one by one
-  await bind.mainSetOption(
-      key: 'custom-rendezvous-server', value: config.idServer);
-  await bind.mainSetOption(key: 'relay-server', value: config.relayServer);
-  await bind.mainSetOption(key: 'api-server', value: config.apiServer);
-  await bind.mainSetOption(key: 'key', value: config.key);
-  final newApiServer = await bind.mainGetApiServer();
-  if (oldApiServer.isNotEmpty &&
-      oldApiServer != newApiServer &&
-      gFFI.userModel.isLogin) {
-    gFFI.userModel.logOut(apiServer: oldApiServer);
+  if (isWeb) {
+    final oldApiServer = await bind.mainGetApiServer();
+    await bind.mainSetOption(
+        key: 'custom-rendezvous-server', value: config.idServer);
+    await bind.mainSetOption(key: 'relay-server', value: config.relayServer);
+    await bind.mainSetOption(key: 'api-server', value: config.apiServer);
+    await bind.mainSetOption(key: 'key', value: config.key);
+    final newApiServer = await bind.mainGetApiServer();
+    if (oldApiServer.isNotEmpty &&
+        oldApiServer != newApiServer &&
+        gFFI.userModel.isLogin) {
+      unawaited(gFFI.userModel.logOut(apiServer: oldApiServer));
+    }
+    return true;
   }
-  return true;
+
+  try {
+    final raw = await bind.mainStageAndPublishServerConfig(
+      idServer: config.idServer,
+      relayServer: config.relayServer,
+      apiServer: config.apiServer,
+      key: config.key,
+    );
+    final result = jsonDecode(raw);
+    if (result is! Map<String, dynamic>) return false;
+    if (result['session_invalidated'] == true) {
+      await gFFI.userModel.reset(resetOther: true);
+    }
+    return true;
+  } catch (error) {
+    debugPrint('服务器配置安全发布失败: $error');
+    return false;
+  }
 }
 
 ColorFilter? svgColor(Color? color) {

@@ -24,7 +24,7 @@ pub struct Session {
 impl Session {
     pub fn new(id: &str, sender: mpsc::UnboundedSender<Data>) -> Self {
         let mut password = "".to_owned();
-        if PeerConfig::load(id).password.is_empty() {
+        if !peer_config_has_explicit_password(&PeerConfig::load(id)) {
             match rpassword::prompt_password("Enter password: ") {
                 Ok(p) => password = p,
                 Err(e) => {

@@ -384,7 +384,9 @@ class _PeerTabPageState extends State<PeerTabPage>
 
   Widget deleteSelection() {
     final model = Provider.of<PeerTabModel>(context);
-    if (model.currentTab == PeerTabIndex.group.index) {
+    if (model.currentTab == PeerTabIndex.group.index ||
+        (model.currentTab == PeerTabIndex.ab.index &&
+            !gFFI.abModel.current.canWrite())) {
       return Offstage();
     }
     return _hoverAction(
@@ -480,6 +482,7 @@ class _PeerTabPageState extends State<PeerTabPage>
     return Offstage(
       offstage: !gFFI.userModel.isLogin ||
           model.currentTab != PeerTabIndex.ab.index ||
+          !gFFI.abModel.current.canWrite() ||
           gFFI.abModel.currentAbTags.isEmpty,
       child: _hoverAction(
               context: context,

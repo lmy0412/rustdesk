@@ -1439,7 +1439,14 @@ impl Connection {
 
     #[inline]
     async fn post_audit_async(url: String, v: Value) -> ResultType<String> {
-        crate::post_request(url, v.to_string(), "").await
+        crate::common::strict_http_request_no_bearer(
+            crate::common::RequestSecurityClass::SensitiveNoBearerStrict,
+            crate::common::StrictHttpRequest::new(crate::common::StrictHttpMethod::Post, url)
+                .json_body(v.to_string()),
+        )
+        .await?
+        .ensure_success()
+        .map(|response| response.body)
     }
 
     fn normalize_port_forward_target(pf: &mut PortForward) -> (String, bool) {

@@ -12,9 +12,10 @@ use bytes::Bytes;
 use hbb_common::config::keys;
 #[cfg(not(feature = "flutter"))]
 use hbb_common::fs;
+#[cfg(not(feature = "flutter"))]
+use hbb_common::{allow_err, config::Config};
 use hbb_common::{
-    allow_err,
-    config::{Config, LocalConfig, PeerConfig},
+    config::PeerConfig,
     get_version_number, log,
     message_proto::*,
     rendezvous_proto::ConnType,
@@ -38,6 +39,7 @@ use std::{
     },
     time::SystemTime,
 };
+#[cfg(feature = "flutter")]
 use uuid::Uuid;
 
 use crate::client::io_loop::Remote;
@@ -72,6 +74,7 @@ pub struct Session<T: InvokeUiSession> {
     pub reconnect_count: Arc<AtomicUsize>,
     pub last_audit_note: Arc<Mutex<String>>,
     pub audit_guid: Arc<Mutex<String>>,
+    pub audit_launch_nonce: Arc<Mutex<String>>,
 }
 
 #[derive(Clone)]
@@ -576,24 +579,120 @@ impl<T: InvokeUiSession> Session<T> {
     }
 
     pub fn get_audit_server(&self, typ: String) -> String {
-        if LocalConfig::get_option("access_token").is_empty() {
-            return "".to_owned();
+        if !matches!(typ.as_str(), "conn" | "conn/active") {
+            return String::new();
         }
-        crate::get_audit_server(
-            Config::get_option("api-server"),
-            Config::get_option("custom-rendezvous-server"),
-            typ,
-        )
+        let Some(launch_nonce) = self.audit_launch_nonce_from_session() else {
+            return String::new();
+        };
+        let connection_session_id = self.lc.read().unwrap().session_id;
+        if crate::ui_interface::audit_capability_available_blocking(
+            launch_nonce,
+            connection_session_id,
+        ) {
+            // 只作为旧界面的可用性哨兵，不暴露真实API地址。
+            "audit-capability://main-ui".to_owned()
+        } else {
+            String::new()
+        }
     }
 
     pub fn send_note(&self, note: String) {
-        let url = self.get_audit_server("conn".to_string());
-        let id = self.get_id();
-        let session_id = self.lc.read().unwrap().session_id;
-        *self.last_audit_note.lock().unwrap() = note.clone();
-        std::thread::spawn(move || {
-            send_note(url, id, session_id, note);
-        });
+        let session = self.clone();
+        let Some(launch_nonce) = self.audit_launch_nonce_from_session() else {
+            if let Some(reason) = audit_note_fail_closed_reason() {
+                self.on_error(reason);
+            }
+            return;
+        };
+        let connection_session_id = self.lc.read().unwrap().session_id;
+        let guid = self.audit_guid.lock().unwrap().clone();
+        std::thread::spawn(
+            move || match crate::ui_interface::write_audit_note_via_main_ui_blocking(
+                launch_nonce,
+                connection_session_id,
+                guid,
+                note.clone(),
+            ) {
+                Ok(()) => *session.last_audit_note.lock().unwrap() = note,
+                Err(_) => {
+                    if let Some(reason) = audit_note_fail_closed_reason() {
+                        session.on_error(reason);
+                    }
+                }
+            },
+        );
+    }
+
+    fn audit_launch_nonce_from_session(&self) -> Option<String> {
+        let mut stored = self.audit_launch_nonce.lock().unwrap();
+        if !stored.is_empty() {
+            return Some(stored.clone());
+        }
+        let prefix = "--audit-capability-launch=";
+        let launch_nonce = self
+            .args
+            .iter()
+            .find_map(|argument| argument.strip_prefix(prefix))
+            .filter(|nonce| !nonce.is_empty())?
+            .to_owned();
+        *stored = launch_nonce.clone();
+        Some(launch_nonce)
+    }
+
+    pub fn ensure_trusted_in_process_audit_launch(&self) -> hbb_common::ResultType<String> {
+        let launch_nonce = {
+            let mut stored = self.audit_launch_nonce.lock().unwrap();
+            if stored.is_empty() {
+                *stored = crate::ui_interface::new_audit_launch_nonce();
+            }
+            stored.clone()
+        };
+        let conn_type = match self.lc.read().unwrap().conn_type {
+            ConnType::FILE_TRANSFER => 1,
+            ConnType::PORT_FORWARD | ConnType::RDP => 2,
+            ConnType::VIEW_CAMERA => 3,
+            ConnType::TERMINAL => 4,
+            _ => 0,
+        };
+        crate::ui_interface::register_trusted_in_process_audit_launch(
+            launch_nonce.clone(),
+            self.get_id(),
+            conn_type,
+        )?;
+        Ok(launch_nonce)
+    }
+
+    pub async fn read_audit_guid(&self, launch_nonce: String) -> hbb_common::ResultType<String> {
+        let connection_session_id = self.lc.read().unwrap().session_id;
+        let guid =
+            crate::ui_interface::read_audit_guid_via_main_ui(launch_nonce, connection_session_id)
+                .await?;
+        if self.lc.read().unwrap().session_id != connection_session_id {
+            hbb_common::bail!("远程连接已变化，忽略迟到的审计GUID");
+        }
+        Ok(guid)
+    }
+
+    pub async fn write_audit_note(
+        &self,
+        launch_nonce: String,
+        guid: String,
+        note: String,
+    ) -> hbb_common::ResultType<()> {
+        let connection_session_id = self.lc.read().unwrap().session_id;
+        crate::ui_interface::write_audit_note_via_main_ui(
+            launch_nonce,
+            connection_session_id,
+            guid,
+            note.clone(),
+        )
+        .await?;
+        if self.lc.read().unwrap().session_id != connection_session_id {
+            hbb_common::bail!("远程连接已变化，忽略迟到的审计备注响应");
+        }
+        *self.last_audit_note.lock().unwrap() = note;
+        Ok(())
     }
 
     #[cfg(not(feature = "flutter"))]
@@ -631,6 +730,10 @@ impl<T: InvokeUiSession> Session<T> {
     }
 
     pub fn get_option(&self, k: String) -> String {
+        if !crate::ui_interface::option_bridge_allows_key(&k) {
+            log::warn!("远程会话通用配置桥拒绝读取受保护认证键");
+            return String::new();
+        }
         if k.eq("remote_dir") {
             return self.lc.read().unwrap().get_remote_dir();
         }
@@ -638,6 +741,10 @@ impl<T: InvokeUiSession> Session<T> {
     }
 
     pub fn set_option(&self, k: String, mut v: String) {
+        if !crate::ui_interface::option_bridge_allows_key(&k) {
+            log::warn!("远程会话通用配置桥拒绝写入受保护认证键");
+            return;
+        }
         let mut lc = self.lc.write().unwrap();
         if k.eq("remote_dir") {
             v = lc.get_all_remote_dir(v);
@@ -1935,7 +2042,8 @@ pub async fn io_loop<T: InvokeUiSession>(handler: Session<T>, round: u32) {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let (sender, mut receiver) = mpsc::unbounded_channel::<Data>();
     *handler.sender.write().unwrap() = Some(sender.clone());
-    let token = LocalConfig::get_option("access_token");
+    // 远程会话子进程不读取主界面账号凭证。
+    let token = String::new();
     let key = crate::get_key(false).await;
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     if handler.is_port_forward() {
@@ -2057,8 +2165,6 @@ async fn start_one_port_forward<T: InvokeUiSession>(
     log::info!("port forward (:{}) exit", port);
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn send_note(url: String, id: String, sid: u64, note: String) {
-    let body = serde_json::json!({ "id": id, "session_id": sid, "note": note });
-    allow_err!(crate::post_request(url, body.to_string(), "").await);
+pub fn audit_note_fail_closed_reason() -> Option<&'static str> {
+    Some("审计备注不可用：主界面授权已失效或本地安全通道已断开")
 }

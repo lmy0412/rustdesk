@@ -1,9 +1,6 @@
-use crate::hbbs_http::create_http_client_with_url;
 use bytes::Bytes;
 use hbb_common::{bail, config::Config, lazy_static, log, ResultType};
-use reqwest::blocking::{Body, Client};
 use scrap::record::RecordState;
-use serde::Serialize;
 use serde_json::Map;
 use std::{
     fs::File,
@@ -30,11 +27,7 @@ pub fn run(rx: Receiver<RecordState>) {
             Config::get_option("api-server"),
             Config::get_option("custom-rendezvous-server"),
         );
-        // This URL is used for TLS connectivity testing and fallback detection.
-        let login_option_url = format!("{}/api/login-options", &api_server);
-        let client = create_http_client_with_url(&login_option_url);
         let mut uploader = RecordUploader {
-            client,
             api_server,
             filepath: Default::default(),
             filename: Default::default(),
@@ -81,7 +74,6 @@ pub fn run(rx: Receiver<RecordState>) {
 }
 
 struct RecordUploader {
-    client: Client,
     api_server: String,
     filepath: String,
     filename: String,
@@ -90,28 +82,43 @@ struct RecordUploader {
     last_send: Instant,
 }
 impl RecordUploader {
-    fn send<Q, B>(&self, query: &Q, body: B) -> ResultType<()>
+    fn send<B>(&self, query: &[(&str, &str)], body: B) -> ResultType<()>
     where
-        Q: Serialize + ?Sized,
-        B: Into<Body>,
+        B: AsRef<[u8]>,
     {
-        match self
-            .client
-            .post(format!("{}/api/record", self.api_server))
-            .query(query)
-            .body(body)
-            .send()
-        {
-            Ok(resp) => {
-                if let Ok(m) = resp.json::<Map<String, serde_json::Value>>() {
-                    if let Some(e) = m.get("error") {
-                        bail!(e.to_string());
-                    }
-                }
-                Ok(())
-            }
-            Err(e) => bail!(e.to_string()),
+        let current_api_server = crate::get_api_server(
+            Config::get_option("api-server"),
+            Config::get_option("custom-rendezvous-server"),
+        );
+        let captured = crate::hbbs_http::auth_binding::normalize_api_base(&self.api_server)?;
+        let current = crate::hbbs_http::auth_binding::normalize_api_base(&current_api_server)?;
+        if captured != current {
+            bail!("record upload API origin changed");
         }
+        let mut url = url::Url::parse(&format!("{captured}/api/record"))?;
+        {
+            let mut pairs = url.query_pairs_mut();
+            for (key, value) in query {
+                pairs.append_pair(key, value);
+            }
+        }
+        let response = crate::common::strict_http_request_no_bearer_blocking(
+            crate::common::RequestSecurityClass::SensitiveNoBearerStrict,
+            crate::common::StrictHttpRequest::new(
+                crate::common::StrictHttpMethod::Post,
+                url.to_string(),
+            )
+            .body_with_content_type(body.as_ref().to_vec(), "application/octet-stream"),
+        )?
+        .ensure_success()?;
+        if let Ok(map) =
+            serde_json::from_str::<Map<String, serde_json::Value>>(&response.body)
+        {
+            if map.contains_key("error") {
+                bail!("record upload was rejected");
+            }
+        }
+        Ok(())
     }
 
     fn handle_new_file(&mut self, filepath: String) -> ResultType<()> {

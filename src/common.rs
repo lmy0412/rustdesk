@@ -38,7 +38,11 @@ use hbb_common::{
 };
 
 use crate::{
-    hbbs_http::{create_http_client_async, get_url_for_tls},
+    hbbs_http::{
+        auth_binding::{self, CredentialedRequestHandle},
+        create_http_client_async, create_strict_http_client, create_strict_http_client_async,
+        get_url_for_tls,
+    },
     ui_interface::{get_api_server as ui_get_api_server, get_option, is_installed, set_option},
 };
 
@@ -64,6 +68,135 @@ pub const TIMER_OUT: Duration = Duration::from_secs(1);
 pub const DEFAULT_KEEP_ALIVE: i32 = 60_000;
 
 const MIN_VER_MULTI_UI_SESSION: &str = "1.2.4";
+const STRICT_HTTP_MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
+const STRICT_HTTP_MAX_RESPONSE_BYTES: u64 = 16 * 1024 * 1024;
+const STRICT_HTTP_MAX_HEADER_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RequestSecurityClass {
+    SessionCredentialedStrict,
+    LoginStrict,
+    OneShotSecretStrict,
+    SensitiveNoBearerStrict,
+    NoSecretMinimal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StrictHttpMethod {
+    Get,
+    Post,
+    Put,
+    Delete,
+    Patch,
+}
+
+impl StrictHttpMethod {
+    fn as_reqwest(self) -> reqwest::Method {
+        match self {
+            Self::Get => reqwest::Method::GET,
+            Self::Post => reqwest::Method::POST,
+            Self::Put => reqwest::Method::PUT,
+            Self::Delete => reqwest::Method::DELETE,
+            Self::Patch => reqwest::Method::PATCH,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct StrictHttpRequest {
+    pub method: StrictHttpMethod,
+    pub url: String,
+    pub body: Option<Vec<u8>>,
+    pub headers: Vec<(String, String)>,
+    pub timeout: Duration,
+}
+
+impl std::fmt::Debug for StrictHttpRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StrictHttpRequest")
+            .field("method", &self.method)
+            .field("url", &auth_binding::redacted_url(&self.url))
+            .field("body_bytes", &self.body.as_ref().map(Vec::len))
+            .field("header_count", &self.headers.len())
+            .field("timeout", &self.timeout)
+            .finish()
+    }
+}
+
+impl StrictHttpRequest {
+    pub fn new(method: StrictHttpMethod, url: impl Into<String>) -> Self {
+        Self {
+            method,
+            url: url.into(),
+            body: None,
+            headers: Vec::new(),
+            timeout: Duration::from_secs(10),
+        }
+    }
+
+    pub fn json_body(mut self, body: impl Into<Vec<u8>>) -> Self {
+        self.body = Some(body.into());
+        self.headers
+            .push(("Content-Type".to_owned(), "application/json".to_owned()));
+        self
+    }
+
+    pub fn body_with_content_type(
+        mut self,
+        body: impl Into<Vec<u8>>,
+        content_type: impl Into<String>,
+    ) -> Self {
+        self.body = Some(body.into());
+        self.headers
+            .push(("Content-Type".to_owned(), content_type.into()));
+        self
+    }
+
+    pub fn header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.push((name.into(), value.into()));
+        self
+    }
+
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
+    }
+}
+
+#[derive(Clone)]
+pub struct StrictHttpResponse {
+    pub status: u16,
+    pub content_type: Option<String>,
+    pub retry_after: Option<String>,
+    pub body: String,
+}
+
+impl std::fmt::Debug for StrictHttpResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StrictHttpResponse")
+            .field("status", &self.status)
+            .field("content_type", &self.content_type)
+            .field("retry_after", &self.retry_after)
+            .field("body", &"<redacted>")
+            .finish()
+    }
+}
+
+impl StrictHttpResponse {
+    pub fn is_success(&self) -> bool {
+        (200..300).contains(&self.status)
+    }
+
+    pub fn ensure_success(self) -> ResultType<Self> {
+        if self.is_success() {
+            Ok(self)
+        } else {
+            bail!("Strict HTTP request failed with status {}", self.status);
+        }
+    }
+}
 
 pub mod input {
     pub const MOUSE_TYPE_MOVE: i32 = 0;
@@ -1185,6 +1318,340 @@ fn get_tcp_proxy_addr() -> String {
     check_port(Config::get_rendezvous_server(), RENDEZVOUS_PORT)
 }
 
+pub async fn strict_http_request(
+    handle: &CredentialedRequestHandle,
+    request: StrictHttpRequest,
+) -> ResultType<StrictHttpResponse> {
+    let context = auth_binding::credentialed_context(handle, &request.url)?;
+    let response = send_strict_request_async(
+        RequestSecurityClass::SessionCredentialedStrict,
+        request,
+        Some(&context.access_token),
+    )
+    .await;
+    if !auth_binding::is_request_current(&context.handle) {
+        bail!("Credentialed request context became stale");
+    }
+    response
+}
+
+pub fn strict_http_request_blocking(
+    handle: &CredentialedRequestHandle,
+    request: StrictHttpRequest,
+) -> ResultType<StrictHttpResponse> {
+    let context = auth_binding::credentialed_context(handle, &request.url)?;
+    let response = send_strict_request_blocking(
+        RequestSecurityClass::SessionCredentialedStrict,
+        request,
+        Some(&context.access_token),
+    );
+    if !auth_binding::is_request_current(&context.handle) {
+        bail!("Credentialed request context became stale");
+    }
+    response
+}
+
+pub async fn strict_http_request_no_bearer(
+    security_class: RequestSecurityClass,
+    request: StrictHttpRequest,
+) -> ResultType<StrictHttpResponse> {
+    ensure_no_bearer_strict_class(security_class)?;
+    send_strict_request_async(security_class, request, None).await
+}
+
+pub fn strict_http_request_no_bearer_blocking(
+    security_class: RequestSecurityClass,
+    request: StrictHttpRequest,
+) -> ResultType<StrictHttpResponse> {
+    ensure_no_bearer_strict_class(security_class)?;
+    send_strict_request_blocking(security_class, request, None)
+}
+
+pub async fn strict_http_request_one_shot_bearer(
+    request: StrictHttpRequest,
+    access_token: String,
+) -> ResultType<StrictHttpResponse> {
+    if access_token.is_empty() {
+        bail!("One-shot credential is empty");
+    }
+    send_strict_request_async(
+        RequestSecurityClass::OneShotSecretStrict,
+        request,
+        Some(&access_token),
+    )
+    .await
+}
+
+pub fn strict_http_request_one_shot_bearer_blocking(
+    request: StrictHttpRequest,
+    access_token: String,
+) -> ResultType<StrictHttpResponse> {
+    if access_token.is_empty() {
+        bail!("One-shot credential is empty");
+    }
+    send_strict_request_blocking(
+        RequestSecurityClass::OneShotSecretStrict,
+        request,
+        Some(&access_token),
+    )
+}
+
+async fn send_strict_request_async(
+    security_class: RequestSecurityClass,
+    request: StrictHttpRequest,
+    bearer: Option<&str>,
+) -> ResultType<StrictHttpResponse> {
+    validate_strict_request(security_class, &request, bearer)?;
+    let client = create_strict_http_client_async(&request.url)?;
+    let mut builder = client
+        .request(request.method.as_reqwest(), &request.url)
+        .timeout(request.timeout);
+    builder = apply_strict_headers_async(builder, &request.headers)?;
+    if let Some(token) = bearer {
+        builder = builder.bearer_auth(token);
+    }
+    if let Some(body) = request.body {
+        builder = builder.body(body);
+    }
+    let response = builder
+        .send()
+        .await
+        .map_err(|_| anyhow!("Strict HTTP transport failed"))?;
+    strict_response_async(response).await
+}
+
+fn send_strict_request_blocking(
+    security_class: RequestSecurityClass,
+    request: StrictHttpRequest,
+    bearer: Option<&str>,
+) -> ResultType<StrictHttpResponse> {
+    validate_strict_request(security_class, &request, bearer)?;
+    let client = create_strict_http_client(&request.url)?;
+    let mut builder = client
+        .request(request.method.as_reqwest(), &request.url)
+        .timeout(request.timeout);
+    builder = apply_strict_headers_blocking(builder, &request.headers)?;
+    if let Some(token) = bearer {
+        builder = builder.bearer_auth(token);
+    }
+    if let Some(body) = request.body {
+        builder = builder.body(body);
+    }
+    let response = builder
+        .send()
+        .map_err(|_| anyhow!("Strict HTTP transport failed"))?;
+    strict_response_blocking(response)
+}
+
+fn ensure_no_bearer_strict_class(security_class: RequestSecurityClass) -> ResultType<()> {
+    match security_class {
+        RequestSecurityClass::LoginStrict
+        | RequestSecurityClass::OneShotSecretStrict
+        | RequestSecurityClass::SensitiveNoBearerStrict => Ok(()),
+        RequestSecurityClass::SessionCredentialedStrict => {
+            bail!("Session credentials require a current native auth handle")
+        }
+        RequestSecurityClass::NoSecretMinimal => {
+            bail!("No-secret minimal requests must use the compatibility transport")
+        }
+    }
+}
+
+fn validate_strict_request(
+    security_class: RequestSecurityClass,
+    request: &StrictHttpRequest,
+    bearer: Option<&str>,
+) -> ResultType<()> {
+    auth_binding::validate_strict_target(&request.url)?;
+    if request.timeout.is_zero() || request.timeout > Duration::from_secs(60) {
+        bail!("Strict HTTP timeout is outside the allowed range");
+    }
+    if request
+        .body
+        .as_ref()
+        .is_some_and(|body| body.len() > STRICT_HTTP_MAX_REQUEST_BYTES)
+    {
+        bail!("Strict HTTP request exceeds its size limit");
+    }
+    match (security_class, bearer.is_some()) {
+        (RequestSecurityClass::SessionCredentialedStrict, false) => {
+            bail!("Session credential is missing")
+        }
+        (RequestSecurityClass::LoginStrict, true)
+        | (RequestSecurityClass::SensitiveNoBearerStrict, true)
+        | (RequestSecurityClass::NoSecretMinimal, true) => {
+            bail!("This strict request class does not accept a bearer credential")
+        }
+        (RequestSecurityClass::NoSecretMinimal, false) => {
+            bail!("No-secret minimal requests must use the compatibility transport")
+        }
+        _ => {}
+    }
+    validate_strict_headers(&request.headers)
+}
+
+fn validate_strict_headers(headers: &[(String, String)]) -> ResultType<()> {
+    let mut names = std::collections::BTreeSet::new();
+    let mut total_bytes = 0usize;
+    for (name, value) in headers {
+        total_bytes = total_bytes
+            .checked_add(name.len())
+            .and_then(|total| total.checked_add(value.len()))
+            .ok_or_else(|| anyhow!("Strict HTTP request headers exceed their size limit"))?;
+        if total_bytes > STRICT_HTTP_MAX_HEADER_BYTES {
+            bail!("Strict HTTP request headers exceed their size limit");
+        }
+        let normalized = name.to_ascii_lowercase();
+        if !names.insert(normalized.clone()) {
+            bail!("Strict HTTP request contains a duplicate header");
+        }
+        if matches!(
+            normalized.as_str(),
+            "authorization"
+                | "cookie"
+                | "host"
+                | "proxy-authorization"
+                | "proxy-connection"
+                | "connection"
+                | "transfer-encoding"
+                | "content-length"
+        ) {
+            bail!("Strict HTTP request contains a forbidden header");
+        }
+        reqwest::header::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| anyhow!("Strict HTTP request contains an invalid header name"))?;
+        reqwest::header::HeaderValue::from_str(value)
+            .map_err(|_| anyhow!("Strict HTTP request contains an invalid header value"))?;
+    }
+    Ok(())
+}
+
+fn apply_strict_headers_async(
+    mut builder: reqwest::RequestBuilder,
+    headers: &[(String, String)],
+) -> ResultType<reqwest::RequestBuilder> {
+    for (name, value) in headers {
+        let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| anyhow!("Strict HTTP request contains an invalid header name"))?;
+        let value = reqwest::header::HeaderValue::from_str(value)
+            .map_err(|_| anyhow!("Strict HTTP request contains an invalid header value"))?;
+        builder = builder.header(name, value);
+    }
+    Ok(builder)
+}
+
+fn apply_strict_headers_blocking(
+    mut builder: reqwest::blocking::RequestBuilder,
+    headers: &[(String, String)],
+) -> ResultType<reqwest::blocking::RequestBuilder> {
+    for (name, value) in headers {
+        let name = reqwest::header::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| anyhow!("Strict HTTP request contains an invalid header name"))?;
+        let value = reqwest::header::HeaderValue::from_str(value)
+            .map_err(|_| anyhow!("Strict HTTP request contains an invalid header value"))?;
+        builder = builder.header(name, value);
+    }
+    Ok(builder)
+}
+
+async fn strict_response_async(mut response: reqwest::Response) -> ResultType<StrictHttpResponse> {
+    let status = response.status().as_u16();
+    if (300..400).contains(&status) {
+        bail!("Strict HTTP redirect rejected with status {status}");
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > STRICT_HTTP_MAX_RESPONSE_BYTES)
+    {
+        bail!("Strict HTTP response exceeds its size limit");
+    }
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| safe_response_metadata(value, 256));
+    let retry_after = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| safe_response_metadata(value, 128));
+    let initial_capacity = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .filter(|length| *length <= STRICT_HTTP_MAX_RESPONSE_BYTES as usize);
+    let initial_capacity = match initial_capacity {
+        Some(length) => length,
+        None => 0,
+    };
+    let mut body = Vec::with_capacity(initial_capacity);
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| anyhow!("Failed to read strict HTTP response"))?
+    {
+        if body.len().saturating_add(chunk.len()) > STRICT_HTTP_MAX_RESPONSE_BYTES as usize {
+            bail!("Strict HTTP response exceeds its size limit");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    let body =
+        String::from_utf8(body).map_err(|_| anyhow!("Strict HTTP response is not valid UTF-8"))?;
+    Ok(StrictHttpResponse {
+        status,
+        content_type,
+        retry_after,
+        body,
+    })
+}
+
+fn strict_response_blocking(
+    response: reqwest::blocking::Response,
+) -> ResultType<StrictHttpResponse> {
+    let status = response.status().as_u16();
+    if (300..400).contains(&status) {
+        bail!("Strict HTTP redirect rejected with status {status}");
+    }
+    if response
+        .content_length()
+        .is_some_and(|length| length > STRICT_HTTP_MAX_RESPONSE_BYTES)
+    {
+        bail!("Strict HTTP response exceeds its size limit");
+    }
+    let content_type = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| safe_response_metadata(value, 256));
+    let retry_after = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| safe_response_metadata(value, 128));
+    let mut limited = std::io::Read::take(response, STRICT_HTTP_MAX_RESPONSE_BYTES + 1);
+    let mut body = Vec::new();
+    std::io::Read::read_to_end(&mut limited, &mut body)
+        .map_err(|_| anyhow!("Failed to read strict HTTP response"))?;
+    if body.len() > STRICT_HTTP_MAX_RESPONSE_BYTES as usize {
+        bail!("Strict HTTP response exceeds its size limit");
+    }
+    let body =
+        String::from_utf8(body).map_err(|_| anyhow!("Strict HTTP response is not valid UTF-8"))?;
+    Ok(StrictHttpResponse {
+        status,
+        content_type,
+        retry_after,
+        body,
+    })
+}
+
+fn safe_response_metadata(value: &str, max_bytes: usize) -> Option<String> {
+    if value.len() <= max_bytes && !value.chars().any(char::is_control) {
+        Some(value.to_owned())
+    } else {
+        None
+    }
+}
+
 /// Send an HTTP request via the rendezvous server's TCP proxy using protobuf.
 /// Connects with `connect_tcp` + `secure_tcp`, sends `HttpProxyRequest`,
 /// receives `HttpProxyResponse`.
@@ -1280,13 +1747,20 @@ fn parse_simple_header(header: &str) -> Vec<HeaderEntry> {
 }
 
 /// POST request via TCP proxy.
-async fn post_request_via_tcp_proxy(url: &str, body: &str, header: &str) -> ResultType<String> {
+async fn post_request_via_tcp_proxy(
+    url: &str,
+    body: &str,
+    header: &str,
+) -> ResultType<(u16, String)> {
     let headers = parse_simple_header(header);
     let resp = tcp_proxy_request("POST", url, body.as_bytes(), headers).await?;
     if !resp.error.is_empty() {
         bail!("TCP proxy error: {}", resp.error);
     }
-    Ok(String::from_utf8_lossy(&resp.body).to_string())
+    Ok((
+        validate_proxy_status(resp.status)?,
+        String::from_utf8_lossy(&resp.body).to_string(),
+    ))
 }
 
 fn http_proxy_response_to_json(resp: HttpProxyResponse) -> ResultType<String> {
@@ -1354,10 +1828,10 @@ async fn with_tcp_proxy_fallback<HttpFut, TcpFut>(
     method: &str,
     http_fn: HttpFut,
     tcp_fn: TcpFut,
-) -> ResultType<String>
+) -> ResultType<(u16, String)>
 where
     HttpFut: Future<Output = ResultType<(u16, String)>>,
-    TcpFut: Future<Output = ResultType<String>>,
+    TcpFut: Future<Output = ResultType<(u16, String)>>,
 {
     if should_use_raw_tcp_for_api(url) {
         return tcp_fn.await;
@@ -1387,23 +1861,27 @@ where
         }
     }
 
-    http_result.map(|(_status, text)| text)
+    http_result
 }
 
-/// POST request with raw TCP proxy support.
-/// - If `USE_RAW_TCP_FOR_API` is "Y" and WS is off, goes directly through TCP proxy.
-/// - Otherwise tries HTTP first; on connection failure or 5xx status,
-///   falls back to TCP proxy if WS is off.
-/// - 4xx responses are returned as-is (server is reachable, business logic error).
-/// - If fallback also fails, returns the original HTTP result (text or error).
+/// 支持原始 TCP 代理回退的 POST 请求。
+/// - `USE_RAW_TCP_FOR_API` 为 `Y` 且未启用 WS 时直接走 TCP 代理。
+/// - 其余情况先走 HTTP；连接失败或服务端返回 5xx 时，可在未启用 WS 时回退。
+/// - 最终仅 2xx 返回响应体，其余状态固定返回不含响应体的错误。
+/// - 回退也失败时保留原 HTTP 结果，再按上述状态规则处理。
 pub async fn post_request(url: String, body: String, header: &str) -> ResultType<String> {
-    with_tcp_proxy_fallback(
+    let (status, response_body) = with_tcp_proxy_fallback(
         &url,
         "POST",
         post_request_http(&url, &body, header),
         post_request_via_tcp_proxy(&url, &body, header),
     )
-    .await
+    .await?;
+    if (200..300).contains(&status) {
+        Ok(response_body)
+    } else {
+        bail!("HTTP POST failed with status {status}");
+    }
 }
 
 #[async_recursion]
@@ -1659,6 +2137,7 @@ pub async fn http_request_sync(
         http_request_via_tcp_proxy(&url, &method, body.as_deref(), &header),
     )
     .await
+    .map(|(_status, response)| response)
 }
 
 /// General HTTP request via TCP proxy. Header is a JSON string (used by http_request_sync).
@@ -1668,12 +2147,20 @@ async fn http_request_via_tcp_proxy(
     method: &str,
     body: Option<&str>,
     header: &str,
-) -> ResultType<String> {
+) -> ResultType<(u16, String)> {
     let headers = parse_json_header_entries(header)?;
     let body_bytes = body.unwrap_or("").as_bytes();
 
     let resp = tcp_proxy_request(method, url, body_bytes, headers).await?;
-    http_proxy_response_to_json(resp)
+    let status = validate_proxy_status(resp.status)?;
+    Ok((status, http_proxy_response_to_json(resp)?))
+}
+
+fn validate_proxy_status(status: i32) -> ResultType<u16> {
+    if !(100..=599).contains(&status) {
+        bail!("TCP proxy returned an invalid HTTP status");
+    }
+    u16::try_from(status).context("TCP proxy returned an invalid HTTP status")
 }
 
 #[inline]
@@ -2971,6 +3458,90 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(err.contains("TCP proxy error: dial failed"));
+    }
+
+    #[test]
+    fn test_strict_request_debug_redacts_body_query_and_header_values() {
+        let secret = "issue9-secret-sentinel";
+        let request = StrictHttpRequest::new(
+            StrictHttpMethod::Post,
+            format!("https://example.com/api/login?code={secret}"),
+        )
+        .json_body(secret.as_bytes().to_vec())
+        .header("X-Test", secret);
+        let debug = format!("{request:?}");
+
+        assert!(!debug.contains(secret));
+        assert!(debug.contains("<redacted>"));
+
+        let response = StrictHttpResponse {
+            status: 200,
+            content_type: Some("application/json".to_owned()),
+            retry_after: None,
+            body: secret.to_owned(),
+        };
+        assert!(!format!("{response:?}").contains(secret));
+    }
+
+    #[test]
+    fn test_strict_validation_rejects_remote_http_and_caller_credentials() {
+        let remote = StrictHttpRequest::new(StrictHttpMethod::Post, "http://example.com/api/login");
+        assert!(validate_strict_request(RequestSecurityClass::LoginStrict, &remote, None).is_err());
+
+        let caller_bearer =
+            StrictHttpRequest::new(StrictHttpMethod::Get, "https://example.com/api/currentUser")
+                .header("Authorization", "Bearer forbidden");
+        assert!(validate_strict_request(
+            RequestSecurityClass::SessionCredentialedStrict,
+            &caller_bearer,
+            Some("internal-token")
+        )
+        .is_err());
+
+        let loopback =
+            StrictHttpRequest::new(StrictHttpMethod::Post, "http://127.0.0.1:21114/api/login");
+        assert!(
+            validate_strict_request(RequestSecurityClass::LoginStrict, &loopback, None).is_ok()
+        );
+    }
+
+    #[test]
+    fn test_strict_validation_rejects_duplicate_headers_and_oversized_body() {
+        let duplicate =
+            StrictHttpRequest::new(StrictHttpMethod::Post, "https://example.com/api/login")
+                .header("Content-Type", "application/json")
+                .header("content-type", "application/json");
+        assert!(
+            validate_strict_request(RequestSecurityClass::LoginStrict, &duplicate, None).is_err()
+        );
+
+        let oversized =
+            StrictHttpRequest::new(StrictHttpMethod::Post, "https://example.com/api/login")
+                .body_with_content_type(
+                    vec![0; STRICT_HTTP_MAX_REQUEST_BYTES + 1],
+                    "application/octet-stream",
+                );
+        assert!(
+            validate_strict_request(RequestSecurityClass::LoginStrict, &oversized, None).is_err()
+        );
+    }
+
+    #[test]
+    fn test_proxy_status_validation_is_bounded() {
+        assert_eq!(validate_proxy_status(204).unwrap(), 204);
+        assert!(validate_proxy_status(-1).is_err());
+        assert!(validate_proxy_status(99).is_err());
+        assert!(validate_proxy_status(600).is_err());
+    }
+
+    #[test]
+    fn test_response_metadata_filter_rejects_control_and_oversize() {
+        assert_eq!(
+            safe_response_metadata("application/json", 32).as_deref(),
+            Some("application/json")
+        );
+        assert!(safe_response_metadata("secret\r\ninjection", 64).is_none());
+        assert!(safe_response_metadata("too-long", 3).is_none());
     }
 
     #[test]

@@ -12,7 +12,7 @@ use crate::{
     privacy_mode,
     privacy_mode::PrivacyModeState,
     rendezvous_mediator::RendezvousMediator,
-    ui_interface::{get_local_option, set_local_option},
+    ui_interface::{get_local_option, option_bridge_allows_key, set_local_option},
 };
 use bytes::Bytes;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -35,7 +35,7 @@ use hbb_common::{
 };
 #[cfg(windows)]
 pub(crate) use ipc_auth::authorize_windows_portable_service_ipc_connection;
-#[cfg(windows)]
+#[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
 pub(crate) use ipc_auth::ensure_peer_executable_matches_current_by_pid_opt;
 #[cfg(windows)]
 pub(crate) use ipc_auth::log_rejected_windows_ipc_connection;
@@ -913,14 +913,30 @@ async fn handle(data: Data, stream: &mut Connection) {
         },
         Data::Options(value) => match value {
             None => {
-                let v = Config::get_options();
+                let mut v = Config::get_options();
+                v.retain(|key, _| option_bridge_allows_key(key));
                 allow_err!(stream.send(&Data::Options(Some(v))).await);
             }
             Some(value) => {
+                if value
+                    .keys()
+                    .any(|key| !option_bridge_allows_key(key.as_str()))
+                {
+                    log::warn!("IPC 通用配置桥拒绝包含受保护认证键的批量写入");
+                    return;
+                }
                 let _chk = CheckIfRestart::new();
                 let _nat = CheckTestNatType::new();
                 if let Some(v) = value.get("privacy-mode-impl-key") {
                     crate::privacy_mode::switch(v);
+                }
+                if crate::hbbs_http::auth_binding::is_main_ui_auth_initialized() {
+                    if let Err(error) =
+                        crate::ui_interface::accept_authoritative_options(value.clone())
+                    {
+                        log::error!("IPC Options 在认证协调前被拒绝: {error}");
+                        return;
+                    }
                 }
                 Config::set_options(value);
                 allow_err!(stream.send(&Data::Options(None)).await);
@@ -932,17 +948,36 @@ async fn handle(data: Data, stream: &mut Connection) {
         }
         Data::SyncConfig(Some(configs)) => {
             let (config, config2) = *configs;
+            if config2
+                .options
+                .keys()
+                .any(|key| !option_bridge_allows_key(key.as_str()))
+            {
+                log::warn!("IPC 同步配置拒绝包含受保护认证键的写入");
+                return;
+            }
             let _chk = CheckIfRestart::new();
+            if crate::hbbs_http::auth_binding::is_main_ui_auth_initialized() {
+                if let Err(error) =
+                    crate::ui_interface::accept_authoritative_options(config2.options.clone())
+                {
+                    log::error!("IPC SyncConfig 在认证协调前被拒绝: {error}");
+                    return;
+                }
+            }
             Config::set(config);
             Config2::set(config2);
             allow_err!(stream.send(&Data::SyncConfig(None)).await);
         }
         Data::SyncConfig(None) => {
+            let config = Config::get();
+            let mut config2 = Config2::get();
+            config2
+                .options
+                .retain(|key, _| option_bridge_allows_key(key));
             allow_err!(
                 stream
-                    .send(&Data::SyncConfig(Some(
-                        (Config::get(), Config2::get()).into()
-                    )))
+                    .send(&Data::SyncConfig(Some((config, config2).into())))
                     .await
             );
         }
@@ -1437,6 +1472,21 @@ where
         }
     }
 
+    /// 为安全敏感的专用IPC在解析长度头时设置硬上限。
+    pub fn new_with_max_packet_length(conn: T, max_packet_length: usize) -> Self {
+        let mut codec = BytesCodec::new();
+        codec.set_max_packet_length(max_packet_length);
+        Self {
+            inner: Framed::new(conn, codec),
+        }
+    }
+
+    pub fn set_max_packet_length(&mut self, max_packet_length: usize) {
+        self.inner
+            .codec_mut()
+            .set_max_packet_length(max_packet_length);
+    }
+
     pub async fn send(&mut self, data: &Data) -> ResultType<()> {
         let v = serde_json::to_vec(data)?;
         self.inner.send(bytes::Bytes::from(v)).await?;
@@ -1721,16 +1771,29 @@ pub async fn get_rendezvous_server(ms_timeout: u64) -> (String, Vec<String>) {
 async fn get_options_(ms_timeout: u64) -> ResultType<HashMap<String, String>> {
     let mut c = connect(ms_timeout, "").await?;
     c.send(&Data::Options(None)).await?;
-    if let Some(Data::Options(Some(value))) = c.next_timeout(ms_timeout).await? {
+    if let Some(Data::Options(Some(mut value))) = c.next_timeout(ms_timeout).await? {
+        value.retain(|key, _| option_bridge_allows_key(key));
+        if crate::hbbs_http::auth_binding::is_main_ui_auth_initialized() {
+            crate::ui_interface::accept_authoritative_options(value.clone())?;
+        }
         Config::set_options(value.clone());
         Ok(value)
     } else {
-        Ok(Config::get_options())
+        let mut value = Config::get_options();
+        value.retain(|key, _| option_bridge_allows_key(key));
+        Ok(value)
     }
 }
 
 pub async fn get_options_async() -> HashMap<String, String> {
-    get_options_(1000).await.unwrap_or(Config::get_options())
+    match get_options_(1000).await {
+        Ok(value) => value,
+        Err(_) => {
+            let mut value = Config::get_options();
+            value.retain(|key, _| option_bridge_allows_key(key));
+            value
+        }
+    }
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -1739,6 +1802,10 @@ pub async fn get_options() -> HashMap<String, String> {
 }
 
 pub async fn get_option_async(key: &str) -> String {
+    if !option_bridge_allows_key(key) {
+        log::warn!("IPC 通用配置桥拒绝读取受保护认证键");
+        return String::new();
+    }
     if let Some(v) = get_options_async().await.get(key) {
         v.clone()
     } else {
@@ -1747,6 +1814,10 @@ pub async fn get_option_async(key: &str) -> String {
 }
 
 pub fn set_option(key: &str, value: &str) {
+    if !option_bridge_allows_key(key) {
+        log::warn!("IPC 通用配置桥拒绝写入受保护认证键");
+        return;
+    }
     let mut options = get_options();
     if value.is_empty() {
         options.remove(key);
@@ -1758,6 +1829,12 @@ pub fn set_option(key: &str, value: &str) {
 
 #[tokio::main(flavor = "current_thread")]
 pub async fn set_options(value: HashMap<String, String>) -> ResultType<()> {
+    if value
+        .keys()
+        .any(|key| !option_bridge_allows_key(key.as_str()))
+    {
+        bail!("IPC generic option bridge rejected a protected authentication key");
+    }
     let _nat = CheckTestNatType::new();
     if let Ok(mut c) = connect(1000, "").await {
         c.send(&Data::Options(Some(value.clone()))).await?;

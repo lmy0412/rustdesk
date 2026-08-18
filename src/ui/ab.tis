@@ -15,7 +15,11 @@ class AddressBook: Reactor.Component
     }();
     
     function render() {
-        if (!handler.get_local_option("access_token")) {
+        var authSession = null;
+        try {
+            authSession = JSON.parse(handler.get_sciter_auth_snapshot()).session;
+        } catch (_) {}
+        if (!authSession) {
             return <div style="margin: *"><div #login-link .link style="margin: *; width: 100px; text-align: center; font-size: 1.2em;">{translate("Login")}</div></div>;
         }
         if (abLoading) {
@@ -647,7 +651,8 @@ function getAb() {
     abLoading = true;
     abError = "";
     app.update();
-    httpRequest(handler.get_api_server() + "/api/ab/get", #post, {}, function(data) {
+    sciterAuthRequest("address_book_get", {}, function(result) {
+        var data = result.data;
         if (data) {
             if (data.error) {
                 handleAbError(data.error);
@@ -661,14 +666,17 @@ function getAb() {
         abLoading = false;
         app.update();
     }, function(err, status) {
+        if (status == -1) {
+            return;
+        }
         handleAbError(err);
-    }, getHttpHeaders());
+    });
 }
 
 function updateAb() {
-    httpRequest(handler.get_api_server() + "/api/ab", #post, { data: JSON.stringify(ab) }, function(data) {
+    sciterAuthRequest("address_book_update", { data: JSON.stringify(ab) }, function(data) {
     }, function(err, status) {
-    }, getHttpHeaders());
+    });
 }
 
 function resetAb() {

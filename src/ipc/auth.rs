@@ -762,14 +762,14 @@ where
         (authorized, peer_uid, active_uid)
     }
 
-    pub(super) fn peer_pid(&self) -> Option<u32> {
+    pub(crate) fn peer_pid(&self) -> Option<u32> {
         peer_pid_from_fd(self.inner.get_ref().as_raw_fd())
     }
 }
 
 #[cfg(windows)]
 impl ConnectionTmpl<parity_tokio_ipc::Connection> {
-    fn peer_pid(&self) -> Option<u32> {
+    pub(crate) fn peer_pid(&self) -> Option<u32> {
         let pipe_handle = self.inner.get_ref().as_raw_handle();
         if pipe_handle.is_null() {
             return None;

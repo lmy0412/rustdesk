@@ -428,10 +428,15 @@ class PasswordComponent: Reactor.Component {
 
 // type: #post, #get, #delete, #put
 function httpRequest(url, type, params, _onSuccess, _onError, headers="") {
-    if (type != #post) {
-        stderr.println("only post ok");
+    if (headers != "") {
+        _onError("Sciter 通用 HTTP 桥拒绝裸请求头", 0);
+        return;
     }
-    handler.post_request(url, JSON.stringify(params), headers);
+    if (type != #post) {
+        _onError("Sciter 通用 HTTP 桥只允许无凭证 POST", 0);
+        return;
+    }
+    handler.post_request(url, JSON.stringify(params), "");
     function check_status() {
         var status = handler.get_async_job_status();
         if (status == " ") self.timer(0.1s, check_status);
@@ -445,6 +450,49 @@ function httpRequest(url, type, params, _onSuccess, _onError, headers="") {
         }
     }
     check_status();
+}
+
+function waitSciterAuthJob(jobId, _onSuccess, _onError) {
+    function check_status() {
+        var status = handler.get_sciter_auth_job_status(jobId);
+        if (status == " ") {
+            self.timer(0.1s, check_status);
+            return;
+        }
+        try {
+            var result = JSON.parse(status || "{}");
+            if (result.kind == "stale") {
+                _onError("", -1);
+            } else if (result.kind == "error" || result.kind == "http_error") {
+                _onError(result.message || translate("Error"), result.status || 0);
+            } else {
+                _onSuccess(result);
+            }
+        } catch (e) {
+            _onError(translate("Error"), 0);
+        }
+    }
+    check_status();
+}
+
+function sciterAuthLogin(params, _onSuccess, _onError, nativeAttempt = "", parentJobId = "") {
+    var jobId = handler.start_sciter_auth_login(
+        JSON.stringify(params), nativeAttempt || "", parentJobId || "");
+    if (!jobId) {
+        _onError(translate("Error"), 0);
+        return "";
+    }
+    waitSciterAuthJob(jobId, _onSuccess, _onError);
+    return jobId;
+}
+
+function sciterAuthRequest(operation, params, _onSuccess, _onError) {
+    var jobId = handler.start_sciter_auth_request(operation, JSON.stringify(params));
+    if (!jobId) {
+        _onError(translate("Error"), 0);
+        return;
+    }
+    waitSciterAuthJob(jobId, _onSuccess, _onError);
 }
 
 function isReasonableSize(r) {

@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:bot_toast/bot_toast.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_hbb/common/shared_state.dart';
@@ -1654,32 +1655,36 @@ Future<bool?> _showConnEndAuditDialogCloseCanceled({
   ffi.dialogManager.dismissAll();
 
   Future<void> updateAuditNoteByGuid(String auditGuid, String note) async {
-    debugPrint('Updating audit note for GUID: $auditGuid, note: $note');
+    debugPrint('Updating audit note');
     try {
+      if (!(isWeb || kIsWeb)) {
+        await bind.sessionWriteAuditNote(
+            sessionId: ffi.sessionId, guid: auditGuid, note: note);
+        debugPrint('Successfully updated audit note');
+        return;
+      }
+
       final apiServer = await bind.mainGetApiServer();
       if (apiServer.isEmpty) {
         debugPrint('API server is empty, cannot update audit note');
         return;
       }
       final url = '$apiServer/api/audit';
-      var headers = getHttpHeaders();
-      headers['Content-Type'] = "application/json";
+      final uri = Uri.parse(url);
       final body = jsonEncode({
         'guid': auditGuid,
         'note': note,
       });
 
-      final response = await http.put(
-        Uri.parse(url),
-        headers: headers,
-        body: body,
-      );
+      final headers = getHttpHeaders();
+      headers['Content-Type'] = "application/json";
+      final response = await http.put(uri, headers: headers, body: body);
 
       if (response.statusCode == 200) {
-        debugPrint('Successfully updated audit note for GUID: $auditGuid');
+        debugPrint('Successfully updated audit note');
       } else {
         debugPrint(
-            'Failed to update audit note. Status: ${response.statusCode}, Body: ${response.body}');
+            'Failed to update audit note. Status: ${response.statusCode}');
       }
     } catch (e) {
       debugPrint('Error updating audit note: $e');

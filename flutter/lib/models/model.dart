@@ -6,6 +6,7 @@ import 'dart:ui' as ui;
 
 import 'package:bot_toast/bot_toast.dart';
 import 'package:desktop_multi_window/desktop_multi_window.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -1195,9 +1196,9 @@ class FfiModel with ChangeNotifier {
       if (bind.isDisableAccount()) {
         return;
       }
-      if (bind
-          .sessionGetAuditServerSync(sessionId: sessionId, typ: "conn/active")
-          .isEmpty) {
+      final auditServer = bind.sessionGetAuditServerSync(
+          sessionId: sessionId, typ: "conn/active");
+      if (auditServer.isEmpty) {
         return;
       }
       if (!mainGetLocalBoolOptionSync(
@@ -1206,11 +1207,6 @@ class FfiModel with ChangeNotifier {
       }
       if (bind.sessionGetAuditGuid(sessionId: sessionId).isNotEmpty) {
         debugPrint('Get cached audit GUID');
-        return;
-      }
-      final url = bind.sessionGetAuditServerSync(
-          sessionId: sessionId, typ: "conn/active");
-      if (url.isEmpty) {
         return;
       }
       final initialConnSessionId =
@@ -1235,20 +1231,31 @@ class FfiModel with ChangeNotifier {
           return;
         }
 
-        final fullUrl =
-            '$url?id=$peerId&session_id=$currentConnSessionId&conn_type=$connType';
-
         debugPrint(
             'Querying audit GUID, attempt $attempt/${retryIntervals.length}');
         try {
-          var headers = getHttpHeaders();
+          if (!(isWeb || kIsWeb)) {
+            final guid = await bind.sessionReadAuditGuid(sessionId: sessionId);
+            if (bind.sessionGetConnSessionId(sessionId: sessionId) !=
+                initialConnSessionId) {
+              debugPrint(
+                  'connSessionId changed, ignoring late audit GUID response');
+              return;
+            }
+            if (guid.isNotEmpty) {
+              bind.sessionSetAuditGuid(sessionId: sessionId, guid: guid);
+              debugPrint('Successfully retrieved audit GUID');
+              return;
+            }
+            throw StateError('主界面未返回有效的审计 GUID');
+          }
+
+          final fullUrl =
+              '$auditServer?id=$peerId&session_id=$currentConnSessionId&conn_type=$connType';
+          final uri = Uri.parse(fullUrl);
+          final headers = getHttpHeaders();
           headers['Content-Type'] = "application/json";
-
-          final response = await http.get(
-            Uri.parse(fullUrl),
-            headers: headers,
-          );
-
+          final response = await http.get(uri, headers: headers);
           if (response.statusCode == 200) {
             final guid = jsonDecode(response.body) as String?;
             if (guid != null && guid.isNotEmpty) {
@@ -1258,7 +1265,7 @@ class FfiModel with ChangeNotifier {
             }
           } else {
             debugPrint(
-                'Failed to query audit GUID. Status: ${response.statusCode}, Body: ${response.body}');
+                'Failed to query audit GUID. Status: ${response.statusCode}');
             return;
           }
         } catch (e) {

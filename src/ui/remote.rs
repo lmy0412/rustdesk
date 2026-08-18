@@ -143,7 +143,10 @@ impl InvokeUiSession for SciterHandler {
 
     fn set_display(&self, x: i32, y: i32, w: i32, h: i32, cursor_embedded: bool, scale: f64) {
         let scale = if scale <= 0.0 { 1.0 } else { scale };
-        self.call("setDisplay", &make_args!(x, y, w, h, cursor_embedded, scale));
+        self.call(
+            "setDisplay",
+            &make_args!(x, y, w, h, cursor_embedded, scale),
+        );
         // https://sciter.com/forums/topic/color_spaceiyuv-crash
         // Nothing spectacular in decoder – done on CPU side.
         // So if you can do BGRA translation on your side – the better.
@@ -658,6 +661,9 @@ impl SciterSession {
             let close_state = self.close_state.clone();
             let mut has_change = false;
             for (k, mut v) in close_state {
+                if crate::client::protected_peer_option_key(&k) {
+                    continue;
+                }
                 if k == "remote_dir" {
                     v = self.lc.read().unwrap().get_all_remote_dir(v);
                 }
@@ -745,6 +751,10 @@ impl SciterSession {
     }
 
     fn save_close_state(&mut self, k: String, v: String) {
+        if crate::client::protected_peer_option_key(&k) {
+            log::warn!("Sciter 会话拒绝缓存受保护的密码来源标记");
+            return;
+        }
         self.close_state.insert(k, v);
     }
 

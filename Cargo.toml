@@ -20,6 +20,11 @@ path = "src/naming.rs"
 name = "service"
 path = "src/service.rs"
 
+[[example]]
+name = "issue9_process_client"
+path = "examples/issue9_process_client.rs"
+required-features = ["flutter"]
+
 [features]
 inline = []
 cli = []

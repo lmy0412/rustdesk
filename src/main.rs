@@ -81,21 +81,19 @@ fn main() {
         common::test_rendezvous_server();
         common::test_nat_type();
         let key = matches.value_of("key").unwrap_or("").to_owned();
-        let token = LocalConfig::get_option("access_token");
         cli::start_one_port_forward(
             options[0].clone(),
             port,
             remote_host,
             remote_port,
             key,
-            token,
+            String::new(),
         );
     } else if let Some(p) = matches.value_of("connect") {
         common::test_rendezvous_server();
         common::test_nat_type();
         let key = matches.value_of("key").unwrap_or("").to_owned();
-        let token = LocalConfig::get_option("access_token");
-        cli::connect_test(p, key, token);
+        cli::connect_test(p, key, String::new());
     } else if let Some(p) = matches.value_of("server") {
         log::info!("id={}", hbb_common::config::Config::get_id());
         crate::start_server(true, false);

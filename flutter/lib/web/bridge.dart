@@ -51,6 +51,156 @@ class EventToUI_Texture implements EventToUI {
 }
 
 class RustdeskImpl {
+  int _webOidcRevision = 0;
+  String? _webOidcAttempt;
+
+  bool _ownsWebOidcAttempt(String attemptJson) =>
+      attemptJson.isNotEmpty && _webOidcAttempt == attemptJson;
+
+  Future<bool> _cancelWebOidcAttempt(String attemptJson) async {
+    if (!_ownsWebOidcAttempt(attemptJson)) return false;
+    // 旧 JS cancel 是全局操作，必须在 exact owner 仍 current 的同一同步栈
+    // 内执行；延后到 Future 会让 A 的迟到 cancel 误停已经启动的 B。
+    js.context.callMethod('setByName', ['account_auth_cancel']);
+    _webOidcAttempt = null;
+    _webOidcRevision += 1;
+    return true;
+  }
+
+  Future<String> mainAuthSnapshot({dynamic hint}) async {
+    throw UnsupportedError('Web 端不支持 native 认证状态');
+  }
+
+  Future<String> mainAuthBeginRequest(
+      {required String url, dynamic hint}) async {
+    throw UnsupportedError('Web 端不支持 native 认证请求');
+  }
+
+  Future<bool> mainAuthIsRequestCurrent(
+      {required String handleJson, dynamic hint}) async {
+    throw UnsupportedError('Web 端不支持 native 认证请求');
+  }
+
+  Future<String> mainAuthStrictRequest({
+    required String handleJson,
+    required String url,
+    required String method,
+    String? body,
+    required String headersJson,
+    required int timeoutMs,
+    dynamic hint,
+  }) async {
+    throw UnsupportedError('Web 端不支持 native 认证传输');
+  }
+
+  Future<String> mainAuthBeginLogin({dynamic hint}) async {
+    throw UnsupportedError('Web 端不支持 native 认证登录');
+  }
+
+  Future<bool> mainAuthAttemptIsCurrent({
+    required String attemptJson,
+    dynamic hint,
+  }) async {
+    return _ownsWebOidcAttempt(attemptJson);
+  }
+
+  Future<bool> mainAuthCancelAttempt({
+    required String attemptJson,
+    dynamic hint,
+  }) async {
+    return _cancelWebOidcAttempt(attemptJson);
+  }
+
+  Future<bool> mainAuthAckAttempt({
+    required String attemptJson,
+    dynamic hint,
+  }) async {
+    if (!_ownsWebOidcAttempt(attemptJson)) return false;
+    _webOidcAttempt = null;
+    _webOidcRevision += 1;
+    return true;
+  }
+
+  Future<String> mainAuthStrictLoginAndCommit({
+    required String attemptJson,
+    required String loginBody,
+    dynamic hint,
+  }) async {
+    throw UnsupportedError('Web 端不支持 native 认证登录');
+  }
+
+  Future<String> mainAuthLogout({
+    required String deviceId,
+    required String deviceUuid,
+    dynamic hint,
+  }) async {
+    throw UnsupportedError('Web 端不支持 native 认证注销');
+  }
+
+  Future<bool> mainAuthClearIfCurrent(
+      {required String handleJson, dynamic hint}) async {
+    throw UnsupportedError('Web 端不支持 native 认证请求');
+  }
+
+  Future<bool> mainAuthCommitPersonalHashReceipt({
+    required String handleJson,
+    required String receiptId,
+    dynamic hint,
+  }) async {
+    throw UnsupportedError('Web 端不支持 native 个人地址簿 hash');
+  }
+
+  Future<bool> mainAuthClearPersonalHashAllowlistIfCurrent({
+    required String handleJson,
+    dynamic hint,
+  }) async {
+    throw UnsupportedError('Web 端不支持 native 个人地址簿 hash');
+  }
+
+  Future<bool> mainAuthSaveAbCacheIfCurrent({
+    required String handleJson,
+    required String payloadJson,
+    dynamic hint,
+  }) async {
+    throw UnsupportedError('Web 端不支持 native 地址簿缓存门禁');
+  }
+
+  Future<bool> mainAuthSaveGroupCacheIfCurrent({
+    required String handleJson,
+    required String payloadJson,
+    dynamic hint,
+  }) async {
+    throw UnsupportedError('Web 端不支持 native 群组缓存门禁');
+  }
+
+  Future<bool> mainClearAbIfNamespace({
+    required String authNamespace,
+    dynamic hint,
+  }) async {
+    throw UnsupportedError('Web 端不支持 native 地址簿缓存清理门禁');
+  }
+
+  Future<bool> mainClearGroupIfNamespace({
+    required String authNamespace,
+    dynamic hint,
+  }) async {
+    throw UnsupportedError('Web 端不支持 native 群组缓存清理门禁');
+  }
+
+  Future<bool> mainAuthCompleteAddressBookPull({
+    required String handleJson,
+    required int expected,
+    required int target,
+    required bool allowReset,
+    dynamic hint,
+  }) async {
+    throw UnsupportedError('Web 端不支持 native 地址簿游标');
+  }
+
+  Future<void> mainAuthWakeAddressBookSync({dynamic hint}) async {
+    throw UnsupportedError('Web 端不支持 native 地址簿同步');
+  }
+
   Future<void> stopGlobalEventStream({required String appType, dynamic hint}) {
     throw UnimplementedError("stopGlobalEventStream");
   }
@@ -789,6 +939,25 @@ class RustdeskImpl {
     return Future(() => js.context.callMethod('setByName', ['options', json]));
   }
 
+  Future<String> mainStageAndPublishServerConfig({
+    required String idServer,
+    required String relayServer,
+    required String apiServer,
+    required String key,
+    dynamic hint,
+  }) async {
+    await mainSetOption(
+        key: 'custom-rendezvous-server', value: idServer, hint: hint);
+    await mainSetOption(key: 'relay-server', value: relayServer, hint: hint);
+    await mainSetOption(key: 'api-server', value: apiServer, hint: hint);
+    await mainSetOption(key: 'key', value: key, hint: hint);
+    return jsonEncode({
+      'base_changed': false,
+      'session_invalidated': false,
+      'snapshot': const <String, dynamic>{},
+    });
+  }
+
   Future<String> mainTestIfValidServer(
       {required String server, required bool testWithProxy, dynamic hint}) {
     // TODO: implement
@@ -1288,6 +1457,19 @@ class RustdeskImpl {
     return js.context.callMethod('getByName', ['audit_server', typ]);
   }
 
+  Future<String> sessionReadAuditGuid(
+      {required UuidValue sessionId, dynamic hint}) {
+    throw UnimplementedError("sessionReadAuditGuid");
+  }
+
+  Future<void> sessionWriteAuditNote(
+      {required UuidValue sessionId,
+      required String guid,
+      required String note,
+      dynamic hint}) {
+    throw UnimplementedError("sessionWriteAuditNote");
+  }
+
   Future<void> sessionSendNote(
       {required UuidValue sessionId, required String note, dynamic hint}) {
     return Future(
@@ -1536,25 +1718,87 @@ class RustdeskImpl {
     throw UnimplementedError("installInstallPath");
   }
 
-  Future<void> mainAccountAuth(
+  Future<String> mainAccountAuth(
       {required String op, required bool rememberMe, dynamic hint}) {
     // Safari only allows auth popups while handling the original user gesture.
     // Use Future.sync so the JS call runs synchronously (pre-opening the OIDC
     // window) while any interop error still surfaces as a Future error.
-    return Future.sync(() => js.context.callMethod('setByName', [
+    return Future.sync(() {
+      final previousAttempt = _webOidcAttempt;
+      if (previousAttempt != null) {
+        // 与 native begin 的 cancel-all 语义一致；必须先同步终结 A，
+        // 再发布 B，避免 B begin 失败时留下无法 exact cancel 的旧 JS A。
+        js.context.callMethod('setByName', ['account_auth_cancel']);
+        if (_webOidcAttempt == previousAttempt) {
+          _webOidcAttempt = null;
+          _webOidcRevision += 1;
+        }
+      }
+      final attemptJson = 'web-oidc:${++_webOidcRevision}:${Uuid().v4()}';
+      _webOidcAttempt = attemptJson;
+      try {
+        js.context.callMethod('setByName', [
           'account_auth',
           jsonEncode({'op': op, 'remember': rememberMe})
-        ]));
+        ]);
+        return attemptJson;
+      } catch (_) {
+        if (_ownsWebOidcAttempt(attemptJson)) {
+          _webOidcAttempt = null;
+          _webOidcRevision += 1;
+        }
+        rethrow;
+      }
+    });
   }
 
-  Future<void> mainAccountAuthCancel({dynamic hint}) {
-    return Future(
-        () => js.context.callMethod('setByName', ['account_auth_cancel']));
+  Future<bool> mainAccountAuthCancel(
+      {required String attemptJson, dynamic hint}) {
+    return _cancelWebOidcAttempt(attemptJson);
   }
 
-  Future<String> mainAccountAuthResult({dynamic hint}) {
-    return Future(
-        () => js.context.callMethod('getByName', ['account_auth_result']));
+  Future<String> mainAccountAuthResult(
+      {required String attemptJson, dynamic hint}) {
+    return Future.sync(() {
+      if (!_ownsWebOidcAttempt(attemptJson)) {
+        return jsonEncode({
+          'native_attempt': attemptJson,
+          'state_msg': '',
+          'failed_msg': '',
+        });
+      }
+
+      final raw = js.context.callMethod('getByName', ['account_auth_result']);
+      if (raw == null || raw == '') {
+        return jsonEncode({
+          'native_attempt': attemptJson,
+          'state_msg': '',
+          'failed_msg': '',
+        });
+      }
+      if (raw is! String) {
+        throw const FormatException('Web OIDC 结果格式无效');
+      }
+      final decoded = jsonDecode(raw);
+      if (decoded == null) {
+        return jsonEncode({
+          'native_attempt': attemptJson,
+          'state_msg': '',
+          'failed_msg': '',
+        });
+      }
+      if (decoded is! Map<String, dynamic>) {
+        throw const FormatException('Web OIDC 结果格式无效');
+      }
+      decoded['native_attempt'] = attemptJson;
+      final authBody = decoded['auth_body'];
+      if (authBody is Map<String, dynamic>) {
+        authBody['native_attempt'] = attemptJson;
+      }
+      decoded['state_msg'] ??= '';
+      decoded['failed_msg'] ??= '';
+      return jsonEncode(decoded);
+    });
   }
 
   Future<void> mainOnMainWindowClose({dynamic hint}) {

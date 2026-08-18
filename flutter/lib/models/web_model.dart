@@ -1,7 +1,6 @@
 // ignore_for_file: avoid_web_libraries_in_flutter
 
 import 'dart:convert';
-import 'dart:js_interop';
 import 'dart:typed_data';
 import 'dart:js';
 import 'dart:html';
@@ -45,6 +44,9 @@ class PlatformFFI {
 
   static get localeName => window.navigator.language;
   RustdeskImpl get ffiBind => _ffiBind;
+
+  // Web 端仍使用浏览器会话，不存在 native pending logout 队列。
+  void schedulePendingLogoutRetries() {}
 
   static Future<String> getVersion() async {
     throw UnimplementedError();
